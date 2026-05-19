@@ -2764,7 +2764,9 @@ impl DatabaseHandle for TurboliteHandle {
             let mut new_manifest = Manifest {
                 version: next_version,
                 change_counter,
-                epoch: old_manifest.epoch,
+                discontinuity_stamp: old_manifest.discontinuity_stamp,
+                cursor: old_manifest.cursor.clone(),
+                writer_id: old_manifest.writer_id.clone(),
                 page_count: old_manifest.page_count,
                 page_size: old_manifest.page_size,
                 pages_per_group: ppg,

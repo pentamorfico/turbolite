@@ -884,7 +884,7 @@ impl TurboliteVfs {
     /// these bytes — they pipe them through as-is.
     pub fn manifest_bytes(&self) -> io::Result<Vec<u8>> {
         let m = self.manifest();
-        super::wire::encode_pure(&m)
+        super::wire::encode(&m).map_err(io::Error::from)
     }
 
     /// Serialize the current manifest while ensuring its replay cursor is at
@@ -902,7 +902,7 @@ impl TurboliteVfs {
         m.change_counter = m.change_counter.max(change_counter);
         manifest::persist_manifest_local(&self.cache.cache_dir, &m)?;
         self.shared_manifest.store(Arc::new(m.clone()));
-        super::wire::encode_pure(&m)
+        super::wire::encode(&m).map_err(io::Error::from)
     }
 
     /// Serialize and install the current manifest with an exact external
@@ -921,13 +921,13 @@ impl TurboliteVfs {
         m.change_counter = change_counter;
         manifest::persist_manifest_local(&self.cache.cache_dir, &m)?;
         self.shared_manifest.store(Arc::new(m.clone()));
-        super::wire::encode_pure(&m)
+        super::wire::encode(&m).map_err(io::Error::from)
     }
 
     /// Decode wire bytes produced by `manifest_bytes` and apply the resulting
     /// page/base manifest via `set_manifest()`.
     pub fn set_manifest_bytes(&self, bytes: &[u8]) -> io::Result<()> {
-        let manifest = super::wire::decode(bytes)?;
+        let manifest = super::wire::decode(bytes).map_err(io::Error::from)?;
         self.set_manifest(manifest);
         Ok(())
     }
@@ -937,7 +937,7 @@ impl TurboliteVfs {
     /// Useful for higher layers that need to inspect the currently published
     /// base manifest before deciding what to publish next.
     pub fn decode_manifest_bytes(bytes: &[u8]) -> io::Result<Manifest> {
-        super::wire::decode(bytes)
+        super::wire::decode(bytes).map_err(io::Error::from)
     }
 
     /// Clone of the VFS-level replay gate. Higher layers (haqlite-turbolite

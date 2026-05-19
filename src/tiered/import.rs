@@ -332,7 +332,7 @@ pub fn import_sqlite_file(
     let mut manifest = Manifest {
         version,
         change_counter: version, // import uses the same value; walrust not relevant for import
-        epoch: 0,
+        discontinuity_stamp: 0,
         page_count,
         page_size,
         pages_per_group: ppg,
@@ -351,6 +351,8 @@ pub fn import_sqlite_file(
         tree_name_to_groups: HashMap::new(),
         group_to_tree_name: HashMap::new(),
         db_header: None, // import doesn't need db_header (fresh import)
+        cursor: super::manifest::ReplayCursor::default(),
+        writer_id: String::new(),
     };
     manifest.build_page_index();
     storage_helpers::put_manifest(backend_ref, runtime_ref, &manifest)?;

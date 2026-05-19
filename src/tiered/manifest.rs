@@ -3,7 +3,12 @@ use std::borrow::Cow;
 use super::*;
 
 /// Remote manifest, updated atomically after all page group uploads.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Default::default()` is provided so test fixtures and partial
+/// constructors can `..Default::default()` over the long field list.
+/// The default value is **not** a valid live manifest (zero page_size /
+/// pages_per_group), it is only a builder base.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Manifest {
     /// Monotonically increasing version (bumped +1 on each checkpoint).
     /// Used for S3 key uniqueness: `pg/{gid}_v{version}`.
@@ -105,13 +110,76 @@ pub struct Manifest {
     /// Discontinuity stamp. Bumped ONLY by out-of-band operations that make
     /// the prior cache invalid (admin-driven fork/rollback/restore). Normal
     /// checkpoints preserve it. Consumers that see a remote manifest whose
-    /// epoch differs from their cached manifest's epoch treat their local
-    /// cache as stale and cold-start from the remote.
+    /// `discontinuity_stamp` differs from their cached manifest's stamp
+    /// treat their local cache as stale and cold-start from the remote.
     ///
-    /// Placed at the end of the struct so adding it doesn't shift any prior
-    /// field's positional index — pre-Strata manifest.msgpack bytes already
-    /// on disk deserialize cleanly (missing trailing element → serde default
-    /// fills `epoch = 0`).
+    /// Renamed from `epoch` in phase 004 to disambiguate from
+    /// `ReplayCursor.epoch` (the lease-holder epoch).
+    ///
+    /// Placed before the cursor/writer_id additions so pre-phase-004
+    /// manifest bytes still decode this slot cleanly (missing trailing
+    /// elements → serde default fills `discontinuity_stamp = 0`).
+    #[serde(default, alias = "epoch")]
+    pub discontinuity_stamp: u64,
+
+    /// Durable replay cursor — the authoritative replay floor for
+    /// followers in phase 004 substrate replay.
+    ///
+    /// `cursor.last_applied_seq` is the seq up to which deltas have been
+    /// folded into this base. Followers replay delta objects with
+    /// `seq > cursor.last_applied_seq`, after first filtering by
+    /// `(cursor.epoch, writer_id)`.
+    ///
+    /// `cursor.base_object_checksum` is BLAKE3 over the canonical-encoded
+    /// bytes of the *published base manifest object* — the anchor every
+    /// delta's `prev_checksum` must chain back to.
+    ///
+    /// `cursor.epoch` is the lease epoch under which this base was
+    /// published. Promotion increments it; followers reject deltas at
+    /// other epochs.
+    ///
+    /// Default-zero values match a fresh-bootstrap manifest where no
+    /// deltas have been applied yet. Older payloads without this field
+    /// decode with `cursor = ReplayCursor::default()`.
+    #[serde(default)]
+    pub cursor: ReplayCursor,
+
+    /// Identifier of the lease holder that published this base manifest.
+    /// Followers filter delta candidates against this writer_id; deltas
+    /// stamped with a different writer_id are dropped before chain
+    /// verification. Empty string for pre-phase-004 / bootstrap manifests
+    /// where fencing is not yet established.
+    #[serde(default)]
+    pub writer_id: String,
+}
+
+/// Durable replay cursor for phase 004 substrate replay.
+///
+/// Followers persist this after each successful atomic apply. The cursor
+/// is the only authoritative replay floor — the SQLite header change
+/// counter is explicitly not load-bearing.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayCursor {
+    /// Seq number of the last delta folded into the published base.
+    /// Followers list delta objects with seq strictly greater than this.
+    #[serde(default)]
+    pub last_applied_seq: u64,
+
+    /// BLAKE3 hash over the canonical-encoded bytes of the published
+    /// base manifest object that this cursor anchors. The first delta
+    /// after this base must carry `prev_checksum == base_object_checksum`.
+    /// 32 bytes of BLAKE3 output stored as a byte vector for serde
+    /// portability (empty vec for the default / un-anchored cursor).
+    /// Encoded as a CBOR array of u8 — deterministic; the BLAKE3
+    /// golden-hash test pins the exact byte layout.
+    #[serde(default)]
+    pub base_object_checksum: Vec<u8>,
+
+    /// Lease epoch under which the anchoring base was published.
+    /// Followers reject delta candidates whose epoch does not equal this.
+    /// Promotion increments the epoch and publishes a new base with the
+    /// new cursor; stale-writer deltas under the prior epoch can never
+    /// chain into the new follower's history.
     #[serde(default)]
     pub epoch: u64,
 }
@@ -220,7 +288,9 @@ impl Manifest {
             tree_name_to_groups: HashMap::new(),
             group_to_tree_name: HashMap::new(),
             db_header: None,
-            epoch: 0,
+            discontinuity_stamp: 0,
+            cursor: ReplayCursor::default(),
+            writer_id: String::new(),
         }
     }
 
