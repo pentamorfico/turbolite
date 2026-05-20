@@ -294,7 +294,11 @@ impl From<&Manifest> for CanonicalManifestV1 {
 
 impl From<CanonicalManifestV1> for Manifest {
     fn from(c: CanonicalManifestV1) -> Self {
-        let mut m = Manifest {
+        // The `#[serde(skip)]` reverse-index fields (page_index,
+        // btree_groups, etc.) are not on the wire; `..Default::default()`
+        // leaves them empty here and VFS-level loaders rebuild them
+        // from `btrees` on load.
+        Manifest {
             version: c.version,
             change_counter: c.change_counter,
             discontinuity_stamp: c.discontinuity_stamp,
@@ -318,15 +322,7 @@ impl From<CanonicalManifestV1> for Manifest {
                 .map(|inner| inner.into_iter().collect())
                 .collect(),
             ..Default::default()
-        };
-        // Skip-serialized reverse indexes are rebuilt by VFS-level
-        // loaders, not by the wire layer. Leave them empty here.
-        m.page_index.clear();
-        m.btree_groups.clear();
-        m.page_to_tree_name.clear();
-        m.tree_name_to_groups.clear();
-        m.group_to_tree_name.clear();
-        m
+        }
     }
 }
 
