@@ -1,6 +1,6 @@
 //! HTTP storage client for turbolite page groups and manifests.
 //!
-//! Speaks the Grabby `/v1/sync/pages/` API with Bearer token auth.
+//! Speaks the cinch `/v1/sync/pages/` sync API with Bearer token auth.
 //! Sync interface (using block_on) matching S3Client's pattern.
 
 use super::*;
