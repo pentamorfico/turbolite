@@ -107,6 +107,12 @@ ciborium = "0.2"
 # canonical-byte hashing of manifest and delta objects (replay cursor
 # / chain verifier).
 blake3 = "1"
+# serde helper so Vec<u8> serializes as a CBOR byte string (major type
+# 2) instead of a CBOR array of u8s (major type 4). Used for the
+# 32-byte BLAKE3 hash inside ReplayCursor.base_object_checksum so the
+# encoding is compact (~34 bytes vs ~64) and matches the wire-level
+# meaning of "a byte string", not "a sequence of small integers".
+serde_bytes = "0.11"
 
 
 [dev-dependencies]

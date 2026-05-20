@@ -191,8 +191,11 @@ pub fn decode(bytes: &[u8]) -> Result<Manifest, PayloadVersionError> {
 /// `ReplayCursor::base_object_checksum` after publishing a base, and
 /// what every following delta's `prev_checksum` must match.
 ///
-/// Wired up by phase 004 step 2 (delta stamping); allow dead_code in
-/// the meantime so the canonical-encoding step can land independently.
+/// Production callers come online in phase 004 step 2 (delta stamping);
+/// for step 1 this is exercised by `checksum_returns_blake3_of_envelope`
+/// so the API surface is covered even before the chain verifier
+/// consumes it. `#[allow(dead_code)]` suppresses the no-lib-callers
+/// warning until step 2 wires the publish path through.
 #[allow(dead_code)]
 pub fn checksum(envelope_bytes: &[u8]) -> [u8; 32] {
     *blake3::hash(envelope_bytes).as_bytes()
@@ -481,11 +484,18 @@ mod tests {
     /// below.
     #[test]
     fn canonical_v1_blake3_golden_hash() {
-        // Pinned on first run against ciborium 0.2 + blake3 1.x +
-        // CanonicalManifestV1 as currently defined. Any future drift
+        // Pinned against ciborium 0.2 + blake3 1.x + serde_bytes 0.11
+        // + CanonicalManifestV1 as currently defined. Any future drift
         // fires this assertion; root-cause it before re-pinning.
+        //
+        // History:
+        // - 1eef8c43...8200ae : initial pin (base_object_checksum as
+        //   CBOR array of u8 — pre-serde_bytes).
+        // - e0ade56a...801202 : current pin (base_object_checksum as
+        //   CBOR byte string via serde_bytes — ~30 bytes smaller per
+        //   hash on the wire).
         const EXPECTED_HEX: &str =
-            "1eef8c43595e21da24171df81a6ffe75f0fba81e87f98034693a0b9b748200ae";
+            "e0ade56a6b38b3b50cfa168abbe704225ad68df56635f62ce3132b66e9801202";
 
         let m = golden_fixture();
         let bytes = encode(&m).expect("encode");
@@ -574,5 +584,83 @@ mod tests {
             err,
             PayloadVersionError::MagicMismatch { .. } | PayloadVersionError::Truncated(_)
         ));
+    }
+
+    /// `Manifest::default()` is a real production state (fresh bootstrap
+    /// with no pages yet). The envelope must encode + decode it cleanly.
+    #[test]
+    fn default_manifest_round_trips_through_envelope() {
+        let m = Manifest::default();
+        let bytes = encode(&m).expect("encode default");
+        // Envelope structure intact even for the empty manifest.
+        assert_eq!(&bytes[..4], &MAGIC);
+        assert_eq!(u16::from_be_bytes([bytes[4], bytes[5]]), VERSION_V1);
+
+        let decoded = decode(&bytes).expect("decode default");
+        // Every observable field matches.
+        assert_eq!(decoded.version, 0);
+        assert_eq!(decoded.change_counter, 0);
+        assert_eq!(decoded.discontinuity_stamp, 0);
+        assert_eq!(decoded.cursor, ReplayCursor::default());
+        assert_eq!(decoded.writer_id, "");
+        assert_eq!(decoded.page_count, 0);
+        assert!(decoded.page_group_keys.is_empty());
+        assert!(decoded.btrees.is_empty());
+        assert!(decoded.interior_chunk_keys.is_empty());
+        assert!(decoded.index_chunk_keys.is_empty());
+        assert!(decoded.frame_tables.is_empty());
+        assert!(decoded.subframe_overrides.is_empty());
+        assert!(decoded.db_header.is_none());
+    }
+
+    /// Decode-then-encode must be the byte-level identity for any
+    /// envelope this code accepts. This catches a class of subtle bugs
+    /// where decode silently drops or reorders information that encode
+    /// re-emits in the original position. Without this, two followers
+    /// could read the same base, compute different envelope hashes, and
+    /// pick different "next deltas".
+    #[test]
+    fn decode_then_re_encode_is_byte_identity() {
+        let original = encode(&golden_fixture()).expect("encode fixture");
+        let decoded = decode(&original).expect("decode envelope");
+        let reencoded = encode(&decoded).expect("re-encode");
+        assert_eq!(
+            original, reencoded,
+            "decode→encode must reproduce identical envelope bytes; \
+             follower hash computations rely on this"
+        );
+    }
+
+    /// The `checksum()` helper is what step 2+ delta stamping will use
+    /// to compute `ReplayCursor::base_object_checksum`. Smoke-test it
+    /// here so we know the function is callable and BLAKE3 produces the
+    /// expected 32-byte output before chain-verification code depends
+    /// on it.
+    #[test]
+    fn checksum_returns_blake3_of_envelope() {
+        let bytes = encode(&golden_fixture()).expect("encode");
+        let hash = checksum(&bytes);
+        assert_eq!(hash.len(), 32, "BLAKE3 output is 32 bytes");
+        // Re-encode and re-hash — must match (canonical + deterministic).
+        let bytes_again = encode(&golden_fixture()).expect("encode");
+        let hash_again = checksum(&bytes_again);
+        assert_eq!(hash, hash_again);
+    }
+
+    /// Pin the first 16 bytes of the envelope (magic + version + the
+    /// start of the CBOR body) so that drift in *envelope structure*
+    /// is caught even if the full-body BLAKE3 hash happens to collide
+    /// (negligible probability but free to assert).
+    #[test]
+    fn envelope_header_bytes_pinned() {
+        let bytes = encode(&golden_fixture()).expect("encode");
+        // Magic + version are byte-stable.
+        assert_eq!(&bytes[..4], b"TLM1", "magic");
+        assert_eq!(&bytes[4..6], &[0x00, 0x01], "version v1 big-endian");
+        // CBOR body begins with a map opener. The CanonicalManifestV1
+        // struct has 18 fields, so ciborium emits a definite-length map
+        // header for 18 entries: major type 5 (map) with count 18.
+        // 0xA0..0xBF is fixmap (count 0..23), so count 18 = 0xB2.
+        assert_eq!(bytes[6], 0xB2, "CBOR map opener for 18 fields");
     }
 }

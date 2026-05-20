@@ -13,12 +13,20 @@ pub struct Manifest {
     /// Monotonically increasing version (bumped +1 on each checkpoint).
     /// Used for S3 key uniqueness: `pg/{gid}_v{version}`.
     pub version: u64,
-    /// Durable replay cursor/floor for physical delta replay.
+    /// Pre-phase-004 replay floor (the SQLite change-counter-based cutoff).
     ///
     /// Checkpoint/import paths initialize this from SQLite's file change counter
     /// (page 0, offset 24). Direct page replay may advance it to the latest
     /// committed changeset sequence even when the SQLite header counter is lower.
-    /// Followers replay delta objects with seq > `change_counter`.
+    ///
+    /// **Phase 004 supersedes this field as the replay floor.** Followers
+    /// must use `cursor.last_applied_seq` (see [`ReplayCursor`]) — the
+    /// SQLite header change counter is explicitly not load-bearing for
+    /// phase-004 replay. `change_counter` is kept here for the step 1→4
+    /// transition so existing flush / handle paths continue to set it
+    /// alongside `cursor`; the field will be removed once every consumer
+    /// reads from the cursor instead.
+    ///
     /// Default 0 for backward compat (delta replay starts from the beginning).
     #[serde(default)]
     pub change_counter: u64,
@@ -170,9 +178,11 @@ pub struct ReplayCursor {
     /// after this base must carry `prev_checksum == base_object_checksum`.
     /// 32 bytes of BLAKE3 output stored as a byte vector for serde
     /// portability (empty vec for the default / un-anchored cursor).
-    /// Encoded as a CBOR array of u8 — deterministic; the BLAKE3
-    /// golden-hash test pins the exact byte layout.
-    #[serde(default)]
+    /// `#[serde(with = "serde_bytes")]` makes CBOR encode this as a
+    /// byte string (major type 2) rather than an array of u8 (major
+    /// type 4). Saves ~30 bytes per hash on the wire and matches the
+    /// semantic meaning. The golden-hash test pins the exact layout.
+    #[serde(default, with = "serde_bytes")]
     pub base_object_checksum: Vec<u8>,
 
     /// Lease epoch under which the anchoring base was published.

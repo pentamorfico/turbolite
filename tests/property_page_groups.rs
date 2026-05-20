@@ -33,7 +33,9 @@ fn make_manifest(
         tree_name_to_groups: HashMap::new(),
         group_to_tree_name: HashMap::new(),
         db_header: None,
-        epoch: 0,
+        discontinuity_stamp: 0,
+        cursor: Default::default(),
+        writer_id: String::new(),
     }
 }
 
@@ -240,7 +242,9 @@ proptest! {
             tree_name_to_groups: HashMap::new(),
             group_to_tree_name: HashMap::new(),
             db_header: None,
-            epoch: 0,
+            discontinuity_stamp: 0,
+            cursor: Default::default(),
+            writer_id: String::new(),
         };
         manifest.build_page_index();
 
