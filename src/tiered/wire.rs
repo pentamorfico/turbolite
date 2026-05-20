@@ -201,6 +201,31 @@ pub fn checksum(envelope_bytes: &[u8]) -> [u8; 32] {
     *blake3::hash(envelope_bytes).as_bytes()
 }
 
+/// The chain anchor for a base manifest — the value a publisher writes
+/// into `cursor.base_object_checksum` and that the first delta after
+/// the base carries as its `prev_checksum`.
+///
+/// Resolves the circular definition in the plan ("base_object_checksum
+/// = hash(this_manifest)"): the manifest contains the field, so it
+/// cannot hash itself directly. We compute the BLAKE3 of the TLM1
+/// envelope encoded with `cursor.base_object_checksum` **cleared**.
+/// The result is bound to the full manifest content (page groups,
+/// cursor seq/epoch, writer_id, everything except the anchor field
+/// itself), deterministic, and non-circular.
+///
+/// Contract:
+/// - Publisher: set `cursor.base_object_checksum = base_anchor_checksum(&m)`
+///   on the manifest it publishes, and stamp the first delta after the
+///   base with `prev_checksum = ` the same value.
+/// - Follower: read `cursor.base_object_checksum` from the base
+///   manifest and use it directly as the chain anchor (no recompute).
+pub fn base_anchor_checksum(manifest: &Manifest) -> Result<[u8; 32], PayloadVersionError> {
+    let mut m = manifest.clone();
+    m.cursor.base_object_checksum = Vec::new();
+    let bytes = encode(&m)?;
+    Ok(checksum(&bytes))
+}
+
 /// Wire-only canonical mirror of [`Manifest`].
 ///
 /// The two structural differences from `Manifest`:
@@ -507,6 +532,29 @@ mod tests {
             hex, EXPECTED_HEX,
             "canonical encoding changed; root-cause before re-pinning"
         );
+    }
+
+    /// base_anchor_checksum is independent of whatever
+    /// cursor.base_object_checksum currently holds (it clears the field
+    /// before hashing), so a publisher can compute it on a manifest
+    /// whose anchor is still empty/stale and get a stable value.
+    #[test]
+    fn base_anchor_checksum_ignores_existing_anchor_field() {
+        let mut m = golden_fixture();
+        m.cursor.base_object_checksum = Vec::new();
+        let a = base_anchor_checksum(&m).expect("anchor");
+
+        // Setting a different (wrong) anchor must not change the result.
+        m.cursor.base_object_checksum = vec![0x11; 32];
+        let b = base_anchor_checksum(&m).expect("anchor");
+        assert_eq!(a, b, "anchor is computed with the field cleared");
+
+        // But changing real content (e.g. the seq) does change it.
+        let mut m2 = golden_fixture();
+        m2.cursor.base_object_checksum = Vec::new();
+        m2.cursor.last_applied_seq += 1;
+        let c = base_anchor_checksum(&m2).expect("anchor");
+        assert_ne!(a, c, "anchor is bound to the rest of the manifest content");
     }
 
     #[test]
