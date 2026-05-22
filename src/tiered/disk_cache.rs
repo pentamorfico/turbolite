@@ -98,6 +98,13 @@ impl CacheIndex {
         self.entries.contains_key(&page_num)
     }
 
+    /// Sum of live (still-indexed) compressed bytes. `next_offset` is the
+    /// physical file high-water mark; the gap between the two is dead space left
+    /// by evicted pages (compressed mode never hole-punches).
+    pub(crate) fn live_bytes(&self) -> u64 {
+        self.entries.values().map(|e| e.compressed_len as u64).sum()
+    }
+
     /// Remove a page from the index.
     pub(crate) fn remove(&mut self, page_num: u64) {
         self.entries.remove(&page_num);
@@ -236,6 +243,11 @@ pub(crate) struct DiskCache {
     /// Index mapping page_num -> (offset, compressed_len) in the compressed cache file.
     /// Only populated when cache_compression is true.
     pub(crate) cache_index: parking_lot::Mutex<CacheIndex>,
+    /// Guards the compressed cache file against concurrent compaction. Reads and
+    /// writes of compressed pages take a read guard; `compact_compressed_cache`
+    /// takes the write guard so it can rewrite blobs + swap offsets exclusively.
+    /// Uncompressed mode never takes this (zero overhead there).
+    pub(crate) compaction_lock: parking_lot::RwLock<()>,
     /// Raw zstd dictionary bytes for cache compression/decompression.
     /// Shared via Arc so DiskCache (which is Arc<DiskCache>) can be used from multiple threads.
     /// EncoderDictionary/DecoderDictionary are created on each use (cheap, same pattern as PrefetchPool).
@@ -284,6 +296,13 @@ pub(crate) struct DiskCache {
     /// consistent state, and the new VFS instance starts with a
     /// fresh (untainted) flag.
     pub(crate) tainted: std::sync::atomic::AtomicBool,
+
+    /// Disk-cache size budget in bytes for the lazy mid-query trim (0 =
+    /// disabled). Mirrors the handle's `cache_limit` so the every-64-fetch
+    /// hook in `mark_group_present` can trim toward budget without an
+    /// end-of-query boundary. A single large scan would otherwise grow the
+    /// cache unbounded until the query ends.
+    pub(crate) cache_budget_bytes: AtomicU64,
 }
 
 /// Counter for lazy eviction (every 64 group fetches).
@@ -377,10 +396,20 @@ impl DiskCache {
             .open(cache_file_path)?;
         let cache_file_was_empty = cache_file.metadata()?.len() == 0;
 
-        // For uncompressed mode: extend to full size (sparse file).
+        // For uncompressed mode: extend to full size (sparse file). When
+        // encryption is on, each page slot is widened to hold its inline
+        // random-nonce GCM frame, so pre-size with the encrypted stride.
         // For compressed mode: the file grows via append, no pre-allocation needed.
         if !cache_compression && page_count > 0 && page_size > 0 {
-            let target_size = page_count * page_size as u64;
+            #[cfg(feature = "encryption")]
+            let slot = if encryption_key.is_some() {
+                page_size as u64 + compress::GCM_RANDOM_NONCE_OVERHEAD as u64
+            } else {
+                page_size as u64
+            };
+            #[cfg(not(feature = "encryption"))]
+            let slot = page_size as u64;
+            let target_size = page_count * slot;
             let meta = cache_file.metadata()?;
             if meta.len() < target_size {
                 cache_file.set_len(target_size)?;
@@ -533,6 +562,7 @@ impl DiskCache {
             cache_compression,
             cache_compression_level,
             cache_index: parking_lot::Mutex::new(cache_index),
+            compaction_lock: parking_lot::RwLock::new(()),
             #[cfg(feature = "zstd")]
             dictionary: dictionary.map(|d| Arc::new(d)),
             stat_hits: AtomicU64::new(0),
@@ -546,6 +576,7 @@ impl DiskCache {
             #[cfg(test)]
             fail_rollback_after: std::sync::atomic::AtomicI64::new(i64::MAX),
             tainted: std::sync::atomic::AtomicBool::new(false),
+            cache_budget_bytes: AtomicU64::new(0),
         })
     }
 
@@ -676,6 +707,29 @@ impl DiskCache {
         }
     }
 
+    /// Per-page byte stride in the **uncompressed** cache file.
+    ///
+    /// Without encryption a page occupies exactly `page_size` bytes at
+    /// `page_num * page_size`. With encryption each page is stored as a
+    /// random-nonce GCM frame (`[12-byte nonce][page_size ciphertext][16-byte
+    /// tag]`), so the slot is widened by `GCM_RANDOM_NONCE_OVERHEAD`. A fresh
+    /// nonce per write makes page rewrites safe (no keystream/nonce reuse).
+    #[inline]
+    fn slot_stride(&self) -> u64 {
+        let ps = self.page_size.load(Ordering::Acquire) as u64;
+        #[cfg(feature = "encryption")]
+        if self.encryption_key.is_some() {
+            return ps + compress::GCM_RANDOM_NONCE_OVERHEAD as u64;
+        }
+        ps
+    }
+
+    /// Byte offset of `page_num`'s slot in the uncompressed cache file.
+    #[inline]
+    fn slot_offset(&self, page_num: u64) -> u64 {
+        page_num * self.slot_stride()
+    }
+
     /// Ensure the cache file is at least `needed` bytes. Lock-free fast path
     /// when file is already large enough; mutex only for the rare set_len.
     fn ensure_file_len(&self, needed: u64) -> io::Result<()> {
@@ -742,19 +796,36 @@ impl DiskCache {
             // Miss: fall through to pread (page not decoded yet or evicted)
         }
 
-        let offset = page_num * self.page_size.load(Ordering::Acquire) as u64;
-        self.cache_file.read_exact_at(buf, offset)?;
         #[cfg(feature = "encryption")]
         if let Some(ref key) = self.encryption_key {
-            let decrypted = compress::decrypt_ctr(buf, page_num, key)?;
-            buf.copy_from_slice(&decrypted);
+            // Encrypted slot: read the full GCM frame, decrypt to a full page,
+            // then copy the requested prefix (SQLite may request a partial read
+            // such as the 16/100-byte file header).
+            let ps = self.page_size.load(Ordering::Acquire) as usize;
+            let stride = ps + compress::GCM_RANDOM_NONCE_OVERHEAD;
+            let mut frame = vec![0u8; stride];
+            self.cache_file
+                .read_exact_at(&mut frame, page_num * stride as u64)?;
+            // Local positional cache slot (keyed by file offset, never moved
+            // across slots), so no slot-identity AAD is needed.
+            let plain = compress::decrypt_gcm_random_nonce(&frame, &[], key)?;
+            let copy_len = buf.len().min(plain.len());
+            buf[..copy_len].copy_from_slice(&plain[..copy_len]);
+            return Ok(());
         }
+
+        let offset = page_num * self.page_size.load(Ordering::Acquire) as u64;
+        self.cache_file.read_exact_at(buf, offset)?;
         Ok(())
     }
 
     /// Read a page from the compressed cache: index lookup -> pread -> decrypt -> decompress.
     fn read_page_compressed(&self, page_num: u64, buf: &mut [u8]) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
+
+        // Fence against in-place compaction: hold the read guard so the index
+        // lookup and the pread that follows see a consistent layout.
+        let _compact = self.compaction_lock.read();
 
         let entry = {
             let index = self.cache_index.lock();
@@ -774,10 +845,10 @@ impl DiskCache {
         self.cache_file
             .read_exact_at(&mut compressed, entry.offset)?;
 
-        // Decrypt if encrypted (CTR, same size)
+        // Decrypt if encrypted (random-nonce GCM; nonce stored inline)
         #[cfg(feature = "encryption")]
         if let Some(ref key) = self.encryption_key {
-            let decrypted = compress::decrypt_ctr(&compressed, page_num, key)?;
+            let decrypted = compress::decrypt_gcm_random_nonce(&compressed, &[], key)?;
             compressed = decrypted;
         }
 
@@ -881,19 +952,19 @@ impl DiskCache {
             ));
         }
 
-        let offset = page_num * self.page_size.load(Ordering::Acquire) as u64;
-
-        // CTR encryption: same size, no overhead. Encrypt before
-        // pwrite. The bitmap and mem_cache are NOT touched.
+        // Random-nonce GCM frame (fresh nonce per write, stored inline) so a
+        // page rewrite never reuses a nonce/keystream. The slot stride widens
+        // by GCM_RANDOM_NONCE_OVERHEAD. The bitmap and mem_cache are NOT touched.
         let _enc_buf: Vec<u8>;
         #[cfg(feature = "encryption")]
         let data = if let Some(ref key) = self.encryption_key {
-            _enc_buf = compress::encrypt_ctr(data, page_num, key)?;
+            _enc_buf = compress::encrypt_gcm_random_nonce(data, &[], key)?;
             _enc_buf.as_slice()
         } else {
             data
         };
 
+        let offset = self.slot_offset(page_num);
         let needed = offset + data.len() as u64;
         self.ensure_file_len(needed)?;
         self.cache_file.write_all_at(data, offset)?;
@@ -907,35 +978,42 @@ impl DiskCache {
             return self.write_page_compressed(page_num, data);
         }
 
-        let offset = page_num * self.page_size.load(Ordering::Acquire) as u64;
+        // Plaintext page data, kept for the mem_cache update below (which must
+        // store decrypted bytes). `write_data` is what actually hits disk.
+        let plain = data;
 
-        // CTR encryption: same size, no overhead
-        let _write_data: Vec<u8>;
+        // Random-nonce GCM frame (fresh nonce per write, stored inline). The
+        // slot stride widens by GCM_RANDOM_NONCE_OVERHEAD so a rewrite of the
+        // same page never reuses a nonce/keystream.
+        let _enc_buf: Vec<u8>;
         #[cfg(feature = "encryption")]
         let data = if let Some(ref key) = self.encryption_key {
-            _write_data = compress::encrypt_ctr(data, page_num, key)?;
-            _write_data.as_slice()
+            _enc_buf = compress::encrypt_gcm_random_nonce(data, &[], key)?;
+            _enc_buf.as_slice()
         } else {
             data
         };
 
+        let offset = self.slot_offset(page_num);
         let needed = offset + data.len() as u64;
 
         // Extend file if needed (serialized via mutex), then pwrite (lock-free)
         self.ensure_file_len(needed)?;
         self.cache_file.write_all_at(data, offset)?;
         self.bitmap_mark(page_num);
-        // Update in-memory cache if page is already cached (keep dirty data consistent).
-        // Don't promote on write -- read path handles promotion.
+        // Update in-memory cache if page is already cached (keep dirty data
+        // consistent). The mem_cache holds PLAINTEXT pages, so copy from `plain`
+        // (not the encrypted on-disk frame). Don't promote on write -- read path
+        // handles promotion.
         if let Some(ref mc) = self.mem_cache {
             if let Some(slot) = mc.get(page_num as usize) {
                 let ptr = slot.load(Ordering::Relaxed);
                 if !ptr.is_null() {
-                    let copy_len = data
+                    let copy_len = plain
                         .len()
                         .min(self.page_size.load(Ordering::Relaxed) as usize);
                     unsafe {
-                        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, copy_len);
+                        std::ptr::copy_nonoverlapping(plain.as_ptr(), ptr, copy_len);
                     }
                 }
             }
@@ -946,6 +1024,10 @@ impl DiskCache {
     /// Write a single page in compressed mode: compress -> encrypt -> append -> update index.
     fn write_page_compressed(&self, page_num: u64, data: &[u8]) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
+
+        // Fence against in-place compaction (offset allocation + pwrite must see
+        // a stable layout).
+        let _compact = self.compaction_lock.read();
 
         // Compress (with dictionary if available)
         #[cfg(feature = "zstd")]
@@ -959,10 +1041,10 @@ impl DiskCache {
             None,
         )?;
 
-        // Encrypt compressed blob
+        // Encrypt compressed blob (random-nonce GCM; nonce stored inline)
         #[cfg(feature = "encryption")]
         let blob = if let Some(ref key) = self.encryption_key {
-            compress::encrypt_ctr(&blob, page_num, key)?
+            compress::encrypt_gcm_random_nonce(&blob, &[], key)?
         } else {
             blob
         };
@@ -980,6 +1062,15 @@ impl DiskCache {
         self.cache_file.write_all_at(&blob, offset)?;
 
         self.bitmap_mark(page_num);
+        // Mark the sub-chunk present in the tracker (like the bulk path). Without
+        // this, single-page compressed writes were eviction-blind: the tracker's
+        // byte accounting never saw them, so evict_to_budget could not reclaim
+        // them and the compressed cache file grew unbounded.
+        {
+            let mut tracker = self.tracker.lock();
+            let id = tracker.sub_chunk_for_page(page_num);
+            tracker.mark_present(id, SubChunkTier::Data);
+        }
         Ok(())
     }
 
@@ -1002,27 +1093,33 @@ impl DiskCache {
         // Promote decoded pages to mem_cache BEFORE encryption (we want raw data).
         self.promote_bulk_to_mem_cache(start_page, data, num_pages);
 
-        // CTR encryption: encrypt each page in-place (same size, no overhead)
+        // Encryption: wrap each page in its own random-nonce GCM frame. Each
+        // frame is `page_sz + GCM_RANDOM_NONCE_OVERHEAD` bytes, so the slot
+        // stride widens and the contiguous blob is written at `start_page *
+        // stride`. A fresh nonce per page makes rewrites safe.
         #[cfg(feature = "encryption")]
-        let data = if let Some(ref key) = self.encryption_key {
-            let mut encrypted = Vec::with_capacity(data.len());
+        let (data, stride) = if let Some(ref key) = self.encryption_key {
+            let stride = page_sz + compress::GCM_RANDOM_NONCE_OVERHEAD;
+            let mut encrypted = Vec::with_capacity(num_pages as usize * stride);
             for i in 0..num_pages {
                 let start = i as usize * page_sz;
                 let end = (start + page_sz).min(data.len());
-                encrypted.extend_from_slice(&compress::encrypt_ctr(
+                encrypted.extend_from_slice(&compress::encrypt_gcm_random_nonce(
                     &data[start..end],
-                    start_page + i,
+                    &[],
                     key,
                 )?);
             }
-            encrypted
+            (encrypted, stride)
         } else {
-            data.to_vec()
+            (data.to_vec(), page_sz)
         };
         #[cfg(feature = "encryption")]
         let data = data.as_slice();
+        #[cfg(not(feature = "encryption"))]
+        let stride = page_sz;
 
-        let offset = start_page * page_sz as u64;
+        let offset = start_page * stride as u64;
         let needed = offset + data.len() as u64;
 
         self.ensure_file_len(needed)?;
@@ -1068,6 +1165,9 @@ impl DiskCache {
         use std::os::unix::fs::FileExt;
         let page_sz = self.page_size.load(Ordering::Acquire) as usize;
 
+        // Fence against in-place compaction.
+        let _compact = self.compaction_lock.read();
+
         // Create encoder dictionary once for all pages in this batch
         #[cfg(feature = "zstd")]
         let ed = self.encoder_dict();
@@ -1092,7 +1192,7 @@ impl DiskCache {
 
             #[cfg(feature = "encryption")]
             let compressed = if let Some(ref key) = self.encryption_key {
-                compress::encrypt_ctr(&compressed, start_page + i, key)?
+                compress::encrypt_gcm_random_nonce(&compressed, &[], key)?
             } else {
                 compressed
             };
@@ -1186,23 +1286,26 @@ impl DiskCache {
         // Promote decoded pages to mem_cache before encryption
         self.promote_scattered_to_mem_cache(written_pages, data);
 
-        // Find max page to size the cache file
+        // Find max page to size the cache file (in slot-stride units, which
+        // widen when encryption is on).
+        let stride = self.slot_stride() as usize;
         let max_page = written_pages.iter().copied().max().unwrap_or(0);
-        let needed = (max_page + 1) * page_sz as u64;
+        let needed = (max_page + 1) * stride as u64;
 
         self.ensure_file_len(needed)?;
         for (i, &pnum) in written_pages.iter().enumerate() {
             let src_start = i * page_sz;
             let page_data = &data[src_start..src_start + page_sz];
+            // Fresh random-nonce GCM frame per page (nonce stored inline).
             #[cfg(feature = "encryption")]
             let page_data = if let Some(ref key) = self.encryption_key {
-                &compress::encrypt_ctr(page_data, pnum, key)?
+                &compress::encrypt_gcm_random_nonce(page_data, &[], key)?
             } else {
                 page_data
             };
             #[cfg(not(feature = "encryption"))]
             let page_data = page_data;
-            let offset = pnum * page_sz as u64;
+            let offset = pnum * stride as u64;
             self.cache_file.write_all_at(page_data, offset)?;
         }
 
@@ -1244,6 +1347,9 @@ impl DiskCache {
     ) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
 
+        // Fence against in-place compaction.
+        let _compact = self.compaction_lock.read();
+
         // Create encoder dictionary once for all pages in this batch
         #[cfg(feature = "zstd")]
         let ed = self.encoder_dict();
@@ -1266,7 +1372,7 @@ impl DiskCache {
 
             #[cfg(feature = "encryption")]
             let compressed = if let Some(ref key) = self.encryption_key {
-                compress::encrypt_ctr(&compressed, pnum, key)?
+                compress::encrypt_gcm_random_nonce(&compressed, &[], key)?
             } else {
                 compressed
             };
@@ -1404,7 +1510,38 @@ impl DiskCache {
         if count % 64 == 0 {
             drop(states);
             self.evict_expired();
+            // Mid-query budget trim: TTL eviction alone (default off) lets a
+            // single large scan grow the cache unbounded until the query ends.
+            // Trim toward the size budget here too, skipping in-flight
+            // (Fetching) groups so a hole-punch can't race a page install.
+            let budget = self.cache_budget_bytes.load(Ordering::Relaxed);
+            if budget > 0 {
+                let skip = self.fetching_group_ids();
+                self.evict_to_budget(budget, &skip);
+            }
         }
+    }
+
+    /// Snapshot the set of groups currently in the `Fetching` state. Used by
+    /// the lazy mid-query trim to skip in-flight prefetch groups. (Note:
+    /// `evict_to_budget` also re-checks `Fetching` live per victim, so this is
+    /// a best-effort pre-filter, not the only guard.)
+    fn fetching_group_ids(&self) -> HashSet<u64> {
+        let states = self.group_states.lock();
+        let mut set = HashSet::new();
+        for (i, s) in states.iter().enumerate() {
+            if s.load(Ordering::Acquire) == GroupState::Fetching as u8 {
+                set.insert(i as u64);
+            }
+        }
+        set
+    }
+
+    /// Set the disk-cache size budget for the lazy mid-query trim (0 = disabled).
+    /// Mirrors the handle's `cache_limit`; called on construction and whenever
+    /// the limit changes via PRAGMA.
+    pub(crate) fn set_cache_budget_bytes(&self, budget: u64) {
+        self.cache_budget_bytes.store(budget, Ordering::Relaxed);
     }
 
     /// Reset a group from Fetching back to None (e.g., submit failed or claim no longer needed).
@@ -1642,10 +1779,12 @@ impl DiskCache {
         #[cfg(target_os = "linux")]
         if !self.cache_compression {
             use std::os::unix::io::AsRawFd;
-            let ps = self.page_size.load(Ordering::Acquire) as u64;
+            // Hole-punch the whole slot, which includes the inline nonce/tag
+            // when encryption widens the stride.
+            let stride = self.slot_stride();
             for &pnum in page_nums {
-                let offset = (pnum * ps) as libc::off_t;
-                let len = ps as libc::off_t;
+                let offset = (pnum * stride) as libc::off_t;
+                let len = stride as libc::off_t;
                 unsafe {
                     libc::fallocate(
                         self.cache_file.as_raw_fd(),
@@ -1661,7 +1800,16 @@ impl DiskCache {
     /// Truncate the local page image to a logical page count and clear cache
     /// metadata for pages at or beyond the new end.
     pub(crate) fn truncate_to_page_count(&self, page_count: u64, page_size: u32) -> io::Result<()> {
-        let new_len = page_count * page_size as u64;
+        // Size in slot-stride units (widened when encryption is on).
+        #[cfg(feature = "encryption")]
+        let slot = if self.encryption_key.is_some() {
+            page_size as u64 + compress::GCM_RANDOM_NONCE_OVERHEAD as u64
+        } else {
+            page_size as u64
+        };
+        #[cfg(not(feature = "encryption"))]
+        let slot = page_size as u64;
+        let new_len = page_count * slot;
         {
             let _guard = self.cache_file_extend.lock();
             self.cache_file.set_len(new_len)?;
@@ -1802,6 +1950,12 @@ impl DiskCache {
                     break;
                 }
             }
+            // TOCTOU guard: a group can transition None/Present -> Fetching after
+            // the caller built `skip_groups`. Re-check the live state here so a
+            // hole-punch can never zero a page that a prefetch is installing.
+            if self.group_state(id.group_id as u64) == GroupState::Fetching {
+                continue;
+            }
             // Remove from tracker, then clean disk
             let scbs = {
                 let mut tracker = self.tracker.lock();
@@ -1832,7 +1986,85 @@ impl DiskCache {
                 );
             }
         }
+
+        // Compressed mode never hole-punches (variable-length blobs at packed
+        // offsets), so evicted pages leave dead space and the physical file
+        // (next_offset) grows monotonically. When dead space dominates, compact:
+        // rewrite the live blobs contiguously and reset next_offset. Trigger
+        // only when the file is past a 2x high-water multiple of live bytes (and
+        // non-trivial) so steady-state churn doesn't compact on every pass.
+        if self.cache_compression && evicted > 0 {
+            let (physical, live) = {
+                let index = self.cache_index.lock();
+                (index.next_offset, index.live_bytes())
+            };
+            if live > 0 && physical > live.saturating_mul(2) && physical > (1 << 20) {
+                if let Err(e) = self.compact_compressed_cache() {
+                    eprintln!("[cache] WARN: compressed-cache compaction failed: {}", e);
+                }
+            }
+        }
+
         evicted
+    }
+
+    /// Compact the compressed cache file in place: front-pack the live blobs,
+    /// rebuild the index with packed offsets, reset `next_offset`, and shrink
+    /// the file. Reclaims dead space left by evicted pages. No-op unless
+    /// compression is enabled.
+    ///
+    /// Takes `compaction_lock.write()` so no compressed read/write observes a
+    /// half-moved layout. Blobs only move to **lower** offsets (packed from 0),
+    /// and the index is swapped atomically under the same exclusive guard.
+    pub(crate) fn compact_compressed_cache(&self) -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        if !self.cache_compression {
+            return Ok(());
+        }
+
+        let _compact = self.compaction_lock.write();
+        let _extend = self.cache_file_extend.lock();
+
+        // Snapshot the current entries sorted by offset so front-packing only
+        // ever writes to a position at or below the blob's current location
+        // (never clobbering a not-yet-copied later blob).
+        let mut entries: Vec<(u64, CacheIndexEntry)> = {
+            let index = self.cache_index.lock();
+            index.entries.iter().map(|(&p, &e)| (p, e)).collect()
+        };
+        entries.sort_by_key(|(_, e)| e.offset);
+
+        let mut new_entries: HashMap<u64, CacheIndexEntry> = HashMap::with_capacity(entries.len());
+        let mut cursor = 0u64;
+        for (page_num, e) in &entries {
+            let mut blob = vec![0u8; e.compressed_len as usize];
+            // A read failure on one entry must not corrupt the whole cache;
+            // skip it (the page re-fetches on miss) rather than abort.
+            if self.cache_file.read_exact_at(&mut blob, e.offset).is_err() {
+                continue;
+            }
+            if cursor != e.offset {
+                self.cache_file.write_all_at(&blob, cursor)?;
+            }
+            new_entries.insert(
+                *page_num,
+                CacheIndexEntry {
+                    offset: cursor,
+                    compressed_len: e.compressed_len,
+                },
+            );
+            cursor += e.compressed_len as u64;
+        }
+
+        // Shrink the file to the packed size and swap the index.
+        self.cache_file.set_len(cursor)?;
+        self.cache_file_len.store(cursor, Ordering::Relaxed);
+        {
+            let mut index = self.cache_index.lock();
+            index.entries = new_entries;
+            index.next_offset = cursor;
+        }
+        Ok(())
     }
 
     /// Prune the compressed cache index: remove all entries NOT in `keep_pages`.
@@ -1876,14 +2108,44 @@ impl DiskCache {
         for p in 0..page_count {
             bitmap.mark_present(p);
         }
+        // If this is a shrink (external restore / recovery adopting a smaller
+        // page_count), any leftover bits above the new count would read as
+        // present and serve stale bytes past EOF. Clear them.
+        bitmap.clear_at_or_above(page_count);
+        drop(bitmap);
         let ppg = self.pages_per_group as u64;
         if ppg > 0 {
             let group_count = (page_count + ppg - 1) / ppg;
             let states = self.group_states.lock();
             self.ensure_group_states_capacity(&states, group_count.saturating_sub(1));
-            for gid in 0..group_count as usize {
-                if let Some(s) = states.get(gid) {
+            // Mark live groups Present and any group entirely above the new
+            // page_count None, so a shrink also drops stale group state.
+            for (gid, s) in states.iter().enumerate() {
+                if (gid as u64) < group_count {
                     s.store(GroupState::Present as u8, Ordering::Release);
+                } else {
+                    s.store(GroupState::None as u8, Ordering::Release);
+                }
+            }
+        }
+    }
+
+    /// Clear bitmap bits (and drop group state) for every page at or above
+    /// `page_count`. Used by recovery after adopting a committed page_count so
+    /// a stray higher page from a partial write can't be served as present.
+    pub(crate) fn clear_pages_at_or_above(&self, page_count: u64) {
+        {
+            let bitmap = self.bitmap.read();
+            bitmap.clear_at_or_above(page_count);
+        }
+        let ppg = self.pages_per_group as u64;
+        if ppg > 0 {
+            // First fully-above-count group: ceil(page_count / ppg).
+            let first_dead_group = page_count.div_ceil(ppg) as usize;
+            let states = self.group_states.lock();
+            for (gid, s) in states.iter().enumerate() {
+                if gid >= first_dead_group {
+                    s.store(GroupState::None as u8, Ordering::Release);
                 }
             }
         }

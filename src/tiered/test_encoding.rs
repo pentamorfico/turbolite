@@ -14,6 +14,7 @@ fn test_encode(pages: &[Option<Vec<u8>>], page_size: u32) -> Vec<u8> {
         3,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         None,
     )
     .unwrap()
@@ -25,6 +26,7 @@ fn test_decode(compressed: &[u8]) -> (u32, u32, Vec<Vec<u8>>) {
         compressed,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         None,
     )
     .unwrap()
@@ -123,6 +125,7 @@ fn test_decode_truncated_data() {
         &short,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         None,
     );
     assert!(result.is_err());
@@ -134,6 +137,7 @@ fn test_decode_empty_data() {
         &[],
         #[cfg(feature = "zstd")]
         None,
+        &[],
         None,
     );
     assert!(result.is_err());
@@ -273,6 +277,7 @@ fn test_seekable_encode_decode_roundtrip() {
         3, // compression level
         #[cfg(feature = "zstd")]
         None,
+        &[],
         None,
     )
     .expect("encode seekable");
@@ -290,6 +295,7 @@ fn test_seekable_encode_decode_roundtrip() {
         0,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         None,
     )
     .expect("full decode");
@@ -314,6 +320,7 @@ fn test_seekable_encode_decode_roundtrip() {
         frame_bytes,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         None,
     )
     .expect("subchunk decode");
@@ -334,6 +341,7 @@ fn test_seekable_encode_decode_roundtrip() {
         frame_bytes2,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         None,
     )
     .expect("subchunk2 decode");
@@ -757,6 +765,7 @@ fn test_encode_override_frame_single_page_roundtrip() {
         3,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         None,
     )
     .expect("encode");
@@ -765,6 +774,7 @@ fn test_encode_override_frame_single_page_roundtrip() {
         &encoded,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         None,
     )
     .expect("decode");
@@ -786,6 +796,7 @@ fn test_encode_override_frame_multiple_pages() {
         3,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         None,
     )
     .expect("encode");
@@ -793,6 +804,7 @@ fn test_encode_override_frame_multiple_pages() {
         &encoded,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         None,
     )
     .expect("decode");
@@ -813,6 +825,7 @@ fn test_encode_override_frame_short_page_padding() {
         3,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         None,
     )
     .expect("encode");
@@ -820,6 +833,7 @@ fn test_encode_override_frame_short_page_padding() {
         &encoded,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         None,
     )
     .expect("decode");
@@ -838,6 +852,7 @@ fn test_encode_override_frame_empty() {
         3,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         None,
     )
     .expect("encode");
@@ -845,6 +860,7 @@ fn test_encode_override_frame_empty() {
         &encoded,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         None,
     )
     .expect("decode");
@@ -866,6 +882,7 @@ fn test_encode_override_frame_compression_reduces_size() {
         3,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         None,
     )
     .expect("encode");
@@ -904,10 +921,13 @@ fn test_encrypted_cache_data_on_disk_is_not_plaintext() {
     let page_data = vec![0xABu8; 64];
     cache.write_page(3, &page_data).unwrap();
 
-    // Read raw bytes from cache file — should NOT be plaintext
+    // Read raw bytes from cache file — should NOT be plaintext. Encrypted slots
+    // are widened to hold the inline random-nonce GCM frame (12-byte nonce +
+    // page + 16-byte tag), so page 3 lives at 3 * (64 + 28).
+    let stride = 64 + 28u64;
     let file = std::fs::File::open(dir.path().join("data.cache")).unwrap();
     let mut raw = vec![0u8; 64];
-    file.read_exact_at(&mut raw, 3 * 64).unwrap();
+    file.read_exact_at(&mut raw, 3 * stride + 12).unwrap(); // skip the 12-byte nonce
     assert_ne!(
         &raw[..],
         &page_data[..],
@@ -917,7 +937,7 @@ fn test_encrypted_cache_data_on_disk_is_not_plaintext() {
 
 #[test]
 #[cfg(feature = "encryption")]
-fn test_encrypted_cache_wrong_key_returns_garbage() {
+fn test_encrypted_cache_wrong_key_fails() {
     let dir = TempDir::new().unwrap();
     let key = test_key();
     let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, Some(key), Vec::new()).unwrap();
@@ -926,7 +946,8 @@ fn test_encrypted_cache_wrong_key_returns_garbage() {
     cache.write_page(5, &page_data).unwrap();
     drop(cache);
 
-    // Reopen with wrong key — CTR decrypts to garbage (no auth tag to reject)
+    // Reopen with wrong key — random-nonce GCM authenticates, so a wrong key
+    // is REJECTED (auth failure) rather than silently returning garbage.
     let bad_cache = DiskCache::new(
         dir.path(),
         3600,
@@ -939,10 +960,10 @@ fn test_encrypted_cache_wrong_key_returns_garbage() {
     )
     .unwrap();
     let mut buf = vec![0u8; 64];
-    bad_cache.read_page(5, &mut buf).unwrap();
-    assert_ne!(
-        buf, page_data,
-        "wrong key must not produce correct plaintext"
+    let result = bad_cache.read_page(5, &mut buf);
+    assert!(
+        result.is_err(),
+        "wrong key must fail GCM authentication, not return data"
     );
 }
 
@@ -982,11 +1003,12 @@ fn test_encrypted_cache_different_pages_different_ciphertext() {
     cache.write_page(1, &page_data).unwrap();
 
     let file = std::fs::File::open(dir.path().join("data.cache")).unwrap();
-    let page_sz = 64usize;
-    let mut raw0 = vec![0u8; page_sz];
-    let mut raw1 = vec![0u8; page_sz];
+    // Encrypted slots are widened to page_size + 28 (nonce + tag).
+    let stride = 64 + 28u64;
+    let mut raw0 = vec![0u8; stride as usize];
+    let mut raw1 = vec![0u8; stride as usize];
     file.read_exact_at(&mut raw0, 0).unwrap();
-    file.read_exact_at(&mut raw1, page_sz as u64).unwrap();
+    file.read_exact_at(&mut raw1, stride).unwrap();
     assert_ne!(
         raw0, raw1,
         "same plaintext at different pages must produce different ciphertext"
@@ -995,14 +1017,16 @@ fn test_encrypted_cache_different_pages_different_ciphertext() {
 
 #[test]
 #[cfg(feature = "encryption")]
-fn test_encrypted_cache_file_size_matches_page_size() {
-    // Cache file size = page_count * page_size (no overhead from encryption)
+fn test_encrypted_cache_file_size_matches_widened_stride() {
+    // Encrypted slots are widened to page_size + GCM_RANDOM_NONCE_OVERHEAD so
+    // each page holds its inline random-nonce GCM frame. File is pre-sized to
+    // page_count * (page_size + 28).
     let dir = TempDir::new().unwrap();
     let key = test_key();
     let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, Some(key), Vec::new()).unwrap();
     let _ = cache;
     let meta = std::fs::metadata(dir.path().join("data.cache")).unwrap();
-    assert_eq!(meta.len(), 8 * 64); // page_count * page_size, no overhead
+    assert_eq!(meta.len(), 8 * (64 + 28)); // page_count * widened stride
 }
 
 #[test]
@@ -1022,6 +1046,7 @@ fn test_encode_decode_seekable_encrypted_roundtrip() {
         3,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         Some(&key),
     )
     .unwrap();
@@ -1033,6 +1058,7 @@ fn test_encode_decode_seekable_encrypted_roundtrip() {
             frame_data,
             #[cfg(feature = "zstd")]
             None,
+            &[],
             Some(&key),
         )
         .unwrap();
@@ -1075,6 +1101,7 @@ fn test_encode_decode_seekable_wrong_key_fails() {
         3,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         Some(&key),
     )
     .unwrap();
@@ -1086,6 +1113,7 @@ fn test_encode_decode_seekable_wrong_key_fails() {
         frame_data,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         Some(&wrong_key()),
     );
     assert!(result.is_err(), "wrong key must produce GCM auth error");
@@ -1102,12 +1130,14 @@ fn test_encode_decode_interior_bundle_encrypted_roundtrip() {
     let page_data_1 = vec![0xEEu8; 64];
     let pages: Vec<(u64, &[u8])> = vec![(10, &page_data_0), (20, &page_data_1)];
 
+    let aad = keys::aad_interior_bundle(0);
     let encoded = encode_interior_bundle(
         &pages,
         page_size,
         3,
         #[cfg(feature = "zstd")]
         None,
+        &aad,
         Some(&key),
     )
     .unwrap();
@@ -1117,6 +1147,7 @@ fn test_encode_decode_interior_bundle_encrypted_roundtrip() {
         &encoded,
         #[cfg(feature = "zstd")]
         None,
+        &aad,
         Some(&key),
     )
     .unwrap();
@@ -1131,9 +1162,85 @@ fn test_encode_decode_interior_bundle_encrypted_roundtrip() {
         &encoded,
         #[cfg(feature = "zstd")]
         None,
+        &aad,
         Some(&wrong_key()),
     );
     assert!(result.is_err(), "wrong key must produce GCM auth error");
+
+    // Wrong AAD (e.g. an index bundle slot, or a different chunk id) must
+    // also fail — this is the cross-slot swap-prevention property.
+    let result = decode_interior_bundle(
+        &encoded,
+        #[cfg(feature = "zstd")]
+        None,
+        &keys::aad_index_bundle(0),
+        Some(&key),
+    );
+    assert!(
+        result.is_err(),
+        "interior bundle must not decrypt under an index-bundle AAD (cross-slot swap)"
+    );
+    let result = decode_interior_bundle(
+        &encoded,
+        #[cfg(feature = "zstd")]
+        None,
+        &keys::aad_interior_bundle(1),
+        Some(&key),
+    );
+    assert!(
+        result.is_err(),
+        "interior bundle must not decrypt under a different chunk id's AAD"
+    );
+}
+
+/// F3 regression: a page-group blob bound to one group id's AAD must not be
+/// swappable onto another slot. A blob encrypted with `aad_page_group(1)` fails
+/// to decrypt under `aad_page_group(2)`, and round-trips under `aad_page_group(1)`.
+#[test]
+#[cfg(feature = "encryption")]
+fn test_page_group_aad_binds_to_slot() {
+    let key = test_key();
+    let page_size = 64u32;
+    let pages: Vec<Option<Vec<u8>>> = (0u8..4).map(|i| Some(vec![i + 1; 64])).collect();
+
+    let blob = encode_page_group(
+        &pages,
+        page_size,
+        3,
+        #[cfg(feature = "zstd")]
+        None,
+        &keys::aad_page_group(1),
+        Some(&key),
+    )
+    .unwrap();
+
+    // Swapping the blob onto group 2's slot (decrypt under group 2's AAD) fails.
+    let swapped = decode_page_group(
+        &blob,
+        #[cfg(feature = "zstd")]
+        None,
+        &keys::aad_page_group(2),
+        Some(&key),
+    );
+    assert!(
+        swapped.is_err(),
+        "page-group blob for slot 1 must not decrypt under slot 2's AAD"
+    );
+
+    // Under its own slot AAD it round-trips.
+    let (pc, ps, decoded) = decode_page_group(
+        &blob,
+        #[cfg(feature = "zstd")]
+        None,
+        &keys::aad_page_group(1),
+        Some(&key),
+    )
+    .expect("page-group blob must round-trip under its own slot AAD");
+    assert_eq!(pc, 4);
+    assert_eq!(ps, page_size);
+    for (i, page) in decoded.iter().enumerate() {
+        assert_eq!(page, &vec![(i + 1) as u8; 64]);
+    }
 }
 
 #[test]
@@ -1142,8 +1249,8 @@ fn test_gcm_random_nonce_produces_unique_ciphertext() {
     // Same data encrypted twice must produce different ciphertext (random nonce)
     let key = test_key();
     let data = vec![0xAAu8; 256];
-    let enc1 = compress::encrypt_gcm_random_nonce(&data, &key).unwrap();
-    let enc2 = compress::encrypt_gcm_random_nonce(&data, &key).unwrap();
+    let enc1 = compress::encrypt_gcm_random_nonce(&data, &[], &key).unwrap();
+    let enc2 = compress::encrypt_gcm_random_nonce(&data, &[], &key).unwrap();
 
     // Nonce is first 12 bytes — must differ
     assert_ne!(
@@ -1158,8 +1265,8 @@ fn test_gcm_random_nonce_produces_unique_ciphertext() {
     );
 
     // Both must decrypt to the same original data
-    let dec1 = compress::decrypt_gcm_random_nonce(&enc1, &key).unwrap();
-    let dec2 = compress::decrypt_gcm_random_nonce(&enc2, &key).unwrap();
+    let dec1 = compress::decrypt_gcm_random_nonce(&enc1, &[], &key).unwrap();
+    let dec2 = compress::decrypt_gcm_random_nonce(&enc2, &[], &key).unwrap();
     assert_eq!(dec1, data);
     assert_eq!(dec2, data);
 }
@@ -1169,10 +1276,10 @@ fn test_gcm_random_nonce_produces_unique_ciphertext() {
 fn test_gcm_random_nonce_wrong_key_fails() {
     let key = test_key();
     let data = vec![0xBBu8; 128];
-    let encrypted = compress::encrypt_gcm_random_nonce(&data, &key).unwrap();
+    let encrypted = compress::encrypt_gcm_random_nonce(&data, &[], &key).unwrap();
 
     // Wrong key must produce GCM auth tag failure
-    let result = compress::decrypt_gcm_random_nonce(&encrypted, &wrong_key());
+    let result = compress::decrypt_gcm_random_nonce(&encrypted, &[], &wrong_key());
     assert!(result.is_err(), "wrong key must fail GCM authentication");
 }
 
@@ -1182,12 +1289,12 @@ fn test_gcm_random_nonce_tamper_detection() {
     // Flipping a bit in the ciphertext must be caught by GCM
     let key = test_key();
     let data = vec![0xCCu8; 64];
-    let mut encrypted = compress::encrypt_gcm_random_nonce(&data, &key).unwrap();
+    let mut encrypted = compress::encrypt_gcm_random_nonce(&data, &[], &key).unwrap();
 
     // Flip a bit in the ciphertext body (after the 12-byte nonce prefix)
     encrypted[20] ^= 0x01;
 
-    let result = compress::decrypt_gcm_random_nonce(&encrypted, &key);
+    let result = compress::decrypt_gcm_random_nonce(&encrypted, &[], &key);
     assert!(
         result.is_err(),
         "tampered ciphertext must fail GCM authentication"
@@ -1208,6 +1315,7 @@ fn test_seekable_encode_twice_produces_different_ciphertext() {
         3,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         Some(&key),
     )
     .unwrap();
@@ -1218,6 +1326,7 @@ fn test_seekable_encode_twice_produces_different_ciphertext() {
         3,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         Some(&key),
     )
     .unwrap();

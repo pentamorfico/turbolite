@@ -72,6 +72,14 @@ pub struct TurboliteHandle {
     /// successful sync. Used to detect transaction rollback (lock downgrade
     /// from EXCLUSIVE/RESERVED without sync having been called).
     dirty_since_sync: bool,
+    /// True if xSync (`sync`) has fired since the most recent xWrite. Set in
+    /// `sync`, cleared in `write_all_at`. The lock-downgrade flush gates on
+    /// THIS, not `dirty_since_sync`: under `synchronous=OFF` a rolled-back or
+    /// aborted transaction writes speculative pages (sets `dirty_since_sync`)
+    /// but never calls xSync, so flushing on downgrade would publish those
+    /// uncommitted bytes to S3. Requiring an intervening xSync means only a
+    /// committed (durably-synced) transaction triggers the downgrade flush.
+    synced_since_write: bool,
     /// Cached generation from DiskCache. When this doesn't match cache.generation,
     /// another handle has written pages and the fast path must be skipped.
     cached_generation: u64,
@@ -115,6 +123,13 @@ pub struct TurboliteHandle {
 
     // --- Passthrough mode (WAL/journal) ---
     passthrough_file: Option<RwLock<File>>,
+    /// Per-write random-nonce sidecar for encrypted passthrough (WAL/journal).
+    /// `Some` only when the handle is passthrough AND an encryption key is set.
+    /// Eliminates AES-CTR keystream reuse on in-place WAL frame rewrites: each
+    /// write picks a fresh random nonce stored in a sidecar file keyed by the
+    /// write's start offset, and reads recover the nonce for their range.
+    #[cfg(feature = "encryption")]
+    passthrough_nonces: Option<RwLock<PassthroughNonceMap>>,
 
     // --- Shared ---
     lock: RwLock<LockKind>,
@@ -166,6 +181,190 @@ const PENDING_BYTE: u64 = 0x40000000;
 const RESERVED_BYTE: u64 = PENDING_BYTE + 1;
 const SHARED_FIRST: u64 = PENDING_BYTE + 2;
 const SHARED_SIZE: u64 = 510;
+
+/// Per-write random-nonce sidecar for encrypted passthrough (WAL/journal).
+///
+/// AES-CTR is size-preserving, which the WAL/journal layout requires (SQLite
+/// owns the offsets and expects on-disk bytes to map 1:1 to logical offsets).
+/// A purely positional IV (`iv = offset`) reuses the keystream every time the
+/// same WAL slot is rewritten across transactions/checkpoints — a two-time pad.
+///
+/// Fix: each write picks a fresh random 64-bit nonce and records `(start, len,
+/// nonce)` in this map (persisted to a `.tlnonce` sidecar). Reads find the
+/// write extent covering their range, seek the CTR keystream by the in-extent
+/// byte offset, and decrypt. The data file stays byte-for-byte the same size.
+///
+/// # Sidecar durability and write amplification
+///
+/// The sidecar is an **append-only** log of fixed 24-byte records
+/// (`[start u64 LE][len u64 LE][nonce u64 LE]`). Each WAL write appends exactly
+/// one record and `fdatasync`s it before the corresponding encrypted data write
+/// proceeds, so the nonce is durable no later than the ciphertext it decrypts.
+/// (The previous design rewrote the entire map on every write — O(n) bytes per
+/// write, O(n²) total — and never fsync'd, so a crash could lose a nonce and
+/// leave ciphertext undecryptable.)
+///
+/// On `load`, all records are replayed in append order; a later record for a
+/// region supersedes earlier ones (newest write wins, exactly as `record_write`
+/// dedups in memory). The compacted map is then rewritten atomically
+/// (tmp + rename + fsync) so the on-disk log is bounded by the live extent
+/// count at every open rather than growing without limit across restarts.
+///
+/// Crash consistency: a record appended but not yet matched by a data write is
+/// harmless (it just describes a region whose ciphertext SQLite's WAL recovery
+/// discards). The dangerous direction — ciphertext on disk but its nonce lost —
+/// cannot happen because the nonce is fsync'd before the data write.
+#[cfg(feature = "encryption")]
+pub(crate) struct PassthroughNonceMap {
+    /// Sidecar file path (`<wal_path>.tlnonce`).
+    path: PathBuf,
+    /// start_offset -> (len, nonce). Sorted for range lookup.
+    entries: std::collections::BTreeMap<u64, (u64, u64)>,
+    /// Open append handle to the sidecar log. Lazily (re)opened on first
+    /// write; kept so each `record_write` appends one record without a
+    /// full rewrite.
+    append: Option<std::fs::File>,
+}
+
+#[cfg(feature = "encryption")]
+impl PassthroughNonceMap {
+    /// Sidecar path for a passthrough file.
+    fn sidecar_path(wal_path: &std::path::Path) -> PathBuf {
+        let mut s = wal_path.as_os_str().to_owned();
+        s.push(".tlnonce");
+        PathBuf::from(s)
+    }
+
+    /// Apply one log record to the in-memory map with newest-wins dedup
+    /// (the same semantics as a fresh `record_write`).
+    fn apply_record(
+        entries: &mut std::collections::BTreeMap<u64, (u64, u64)>,
+        start: u64,
+        len: u64,
+        nonce: u64,
+    ) {
+        let end = start.saturating_add(len);
+        let covered: Vec<u64> = entries
+            .range(start..end)
+            .filter(|(&s, &(l, _))| s >= start && s.saturating_add(l) <= end)
+            .map(|(&s, _)| s)
+            .collect();
+        for s in covered {
+            entries.remove(&s);
+        }
+        entries.insert(start, (len, nonce));
+    }
+
+    /// Load the sidecar if present (replaying the append-only log), then
+    /// compact it back to disk so the on-disk log can't grow unbounded.
+    fn load(wal_path: &std::path::Path) -> Self {
+        let path = Self::sidecar_path(wal_path);
+        let mut entries = std::collections::BTreeMap::new();
+        if let Ok(bytes) = std::fs::read(&path) {
+            // Layout: repeated [start u64 LE][len u64 LE][nonce u64 LE],
+            // applied in append order (newest record wins). A torn trailing
+            // partial record (< 24 bytes) is ignored.
+            let mut i = 0usize;
+            while i + 24 <= bytes.len() {
+                let start = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
+                let len = u64::from_le_bytes(bytes[i + 8..i + 16].try_into().unwrap());
+                let nonce = u64::from_le_bytes(bytes[i + 16..i + 24].try_into().unwrap());
+                Self::apply_record(&mut entries, start, len, nonce);
+                i += 24;
+            }
+        }
+        let mut map = Self {
+            path,
+            entries,
+            append: None,
+        };
+        // Best-effort compaction at open: rewrite the log as exactly the live
+        // extents. If it fails we keep the (possibly larger) existing log,
+        // which is still correct.
+        let _ = map.compact();
+        map
+    }
+
+    /// Rewrite the sidecar atomically as exactly the current live extents
+    /// (tmp + fsync + rename), and reopen the append handle on the freshly
+    /// compacted file.
+    fn compact(&mut self) -> io::Result<()> {
+        use std::io::Write;
+        let mut buf = Vec::with_capacity(self.entries.len() * 24);
+        for (start, (len, nonce)) in &self.entries {
+            buf.extend_from_slice(&start.to_le_bytes());
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(&nonce.to_le_bytes());
+        }
+        let tmp = self.path.with_extension("tlnonce.tmp");
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&buf)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &self.path)?;
+        // Reopen for append so subsequent writes extend the compacted file.
+        self.append = Some(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)?,
+        );
+        Ok(())
+    }
+
+    /// Append a single record to the sidecar log and fdatasync it. Opens the
+    /// append handle on demand if compaction hasn't already.
+    fn append_record(&mut self, start: u64, len: u64, nonce: u64) -> io::Result<()> {
+        use std::io::Write;
+        if self.append.is_none() {
+            self.append = Some(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.path)?,
+            );
+        }
+        let f = self.append.as_mut().unwrap();
+        let mut rec = [0u8; 24];
+        rec[0..8].copy_from_slice(&start.to_le_bytes());
+        rec[8..16].copy_from_slice(&len.to_le_bytes());
+        rec[16..24].copy_from_slice(&nonce.to_le_bytes());
+        f.write_all(&rec)?;
+        // Durable before the caller writes the matching ciphertext.
+        f.sync_data()?;
+        Ok(())
+    }
+
+    /// Record a fresh random nonce for a write at `[start, start+len)`,
+    /// append it durably to the sidecar log, and update the in-memory map.
+    /// Drops any prior entries fully contained in the new extent so stale
+    /// sub-writes can't shadow this one. Returns the chosen nonce.
+    fn record_write(&mut self, start: u64, len: u64) -> io::Result<u64> {
+        use rand::RngCore;
+        let mut b = [0u8; 8];
+        rand::thread_rng().fill_bytes(&mut b);
+        let nonce = u64::from_le_bytes(b);
+        self.append_record(start, len, nonce)?;
+        Self::apply_record(&mut self.entries, start, len, nonce);
+        Ok(nonce)
+    }
+
+    /// Find the nonce + extent start covering `[offset, offset+len)`.
+    /// Returns `(extent_start, nonce)` for the newest write whose extent
+    /// fully contains the requested range.
+    fn lookup(&self, offset: u64, len: u64) -> Option<(u64, u64)> {
+        let read_end = offset + len;
+        // The covering extent has start <= offset; scan candidates with
+        // start <= offset, prefer the one with the largest start (most recent
+        // write to that region) that still contains the whole read.
+        self.entries
+            .range(..=offset)
+            .rev()
+            .find(|(&s, &(l, _))| s <= offset && s + l >= read_end)
+            .map(|(&s, &(_, nonce))| (s, nonce))
+    }
+}
 
 impl TurboliteHandle {
     /// Create a tiered handle backed by a pluggable `StorageBackend` +
@@ -266,6 +465,7 @@ impl TurboliteHandle {
                                                             zstd::dict::DecoderDictionary::copy(d)
                                                         })
                                                         .as_ref(),
+                                                    &keys::aad_override_frame(0, frame_idx),
                                                     encryption_key.as_ref(),
                                                 ) {
                                                     let frame_start = frame_idx * spf;
@@ -357,6 +557,15 @@ impl TurboliteHandle {
         // Drop the snapshot; handle uses the shared Arc from now on
         drop(manifest);
 
+        // Mirror the size budget into the cache so the lazy mid-query trim
+        // (every-64-fetch hook) can keep a large scan near budget instead of
+        // growing unbounded until the end-of-query boundary.
+        cache.set_cache_budget_bytes(
+            max_cache_bytes
+                .map(|n| if n == 0 { 0 } else { n })
+                .unwrap_or(0),
+        );
+
         let staging_dir = cache.cache_dir.join("staging");
 
         // Per-handle settings queue. Register on the thread-local stack
@@ -383,6 +592,7 @@ impl TurboliteHandle {
             search_trees: HashSet::new(),
             prefetch_pool,
             dirty_since_sync: false,
+            synced_since_write: false,
             cached_generation: 0,
             gc_enabled,
             override_threshold,
@@ -404,6 +614,8 @@ impl TurboliteHandle {
             staging_seq,
             staging_dir,
             passthrough_file: None,
+            #[cfg(feature = "encryption")]
+            passthrough_nonces: None,
             lock: RwLock::new(LockKind::None),
             db_path,
             lock_file: None,
@@ -420,6 +632,10 @@ impl TurboliteHandle {
         db_path: PathBuf,
         encryption_key: Option<[u8; 32]>,
     ) -> Self {
+        #[cfg(feature = "encryption")]
+        let passthrough_nonces = encryption_key
+            .is_some()
+            .then(|| RwLock::new(PassthroughNonceMap::load(&db_path)));
         Self {
             storage: None,
             runtime: None,
@@ -439,6 +655,7 @@ impl TurboliteHandle {
             search_trees: HashSet::new(),
             prefetch_pool: None,
             dirty_since_sync: false,
+            synced_since_write: false,
             cached_generation: 0,
             gc_enabled: false,
             override_threshold: 0,
@@ -460,6 +677,8 @@ impl TurboliteHandle {
             staging_seq: Arc::new(AtomicU64::new(0)),
             staging_dir: PathBuf::new(),
             passthrough_file: Some(RwLock::new(file)),
+            #[cfg(feature = "encryption")]
+            passthrough_nonces,
             lock: RwLock::new(LockKind::None),
             db_path,
             lock_file: None,
@@ -601,6 +820,7 @@ impl TurboliteHandle {
                     0, // B-tree groups: size from group_page_nums
                     #[cfg(feature = "zstd")]
                     decoder_dict.as_ref(),
+                    &keys::aad_page_group(gid),
                     encryption_key,
                 )?;
                 (c, d)
@@ -610,6 +830,7 @@ impl TurboliteHandle {
                     pg_data,
                     #[cfg(feature = "zstd")]
                     decoder_dict.as_ref(),
+                    &keys::aad_page_group(gid),
                     encryption_key,
                 )?;
                 (c, d)
@@ -669,6 +890,7 @@ impl TurboliteHandle {
             pg_data,
             #[cfg(feature = "zstd")]
             self.decoder_dict.as_ref(),
+            &keys::aad_page_group(gid),
             self.encryption_key.as_ref(),
         )?;
 
@@ -921,7 +1143,17 @@ impl DatabaseHandle for TurboliteHandle {
             file.read_exact_at(buf, offset)?;
             #[cfg(feature = "encryption")]
             if let Some(ref key) = self.encryption_key {
-                let decrypted = compress::decrypt_ctr(buf, offset, key)?;
+                // Recover the per-write random nonce covering this range from
+                // the sidecar, then seek the CTR keystream by the in-extent
+                // offset. A read with no recorded extent (e.g. reading a hole
+                // SQLite never wrote, or a sidecar lost on crash) decrypts to
+                // garbage rather than leaking a fixed-keystream plaintext xor.
+                let nonces = self.passthrough_nonces.as_ref().unwrap().read();
+                let (skip, nonce) = match nonces.lookup(offset, buf.len() as u64) {
+                    Some((start, nonce)) => (offset - start, nonce),
+                    None => (0, offset),
+                };
+                let decrypted = compress::ctr_xor_at(buf, nonce, skip, key)?;
                 buf[..decrypted.len()].copy_from_slice(&decrypted);
             }
             return Ok(());
@@ -941,10 +1173,20 @@ impl DatabaseHandle for TurboliteHandle {
         // FAST PATH: if page is cached, this handle has no dirty pages, AND no other
         // handle has written since we last synced (generation matches), read directly
         // from cache. Skips manifest lookup, prefetch heuristics.
+        //
+        // The `page_num < page_count` bound is load-bearing: after a
+        // truncate-then-regrow the bitmap bit can lag behind the logical size,
+        // and a cached-but-now-out-of-bounds page must NOT short-circuit here —
+        // it has to fall through to the slow path's zero-fill. Without the bound
+        // a read returned stale pre-truncate bytes.
         if !self.dirty_since_sync {
             if let Some(cache) = &self.cache {
                 let current_gen = cache.generation.load(Ordering::Acquire);
-                if current_gen == self.cached_generation && cache.is_present(page_num) {
+                let page_count = self.manifest.load().page_count;
+                if current_gen == self.cached_generation
+                    && page_num < page_count
+                    && cache.is_present(page_num)
+                {
                     cache.read_page(page_num, buf)?;
                     cache.stat_hits.fetch_add(1, Ordering::Relaxed);
                     return Ok(());
@@ -1019,6 +1261,10 @@ impl DatabaseHandle for TurboliteHandle {
                     "cache_limit" => {
                         if let Some(bytes) = settings::parse_byte_size(&update.value) {
                             self.cache_limit = if bytes == 0 { None } else { Some(bytes) };
+                            // Keep the lazy mid-query trim budget in sync.
+                            if let Some(cache) = &self.cache {
+                                cache.set_cache_budget_bytes(bytes);
+                            }
                         }
                     }
                     "evict_on_checkpoint" => {
@@ -1243,6 +1489,7 @@ impl DatabaseHandle for TurboliteHandle {
                                     0,
                                     #[cfg(feature = "zstd")]
                                     self.decoder_dict.as_ref(),
+                                    &keys::aad_page_group(gid),
                                     self.encryption_key.as_ref(),
                                 ) {
                                     cache.write_pages_scattered(
@@ -1259,6 +1506,7 @@ impl DatabaseHandle for TurboliteHandle {
                                 &pg_data,
                                 #[cfg(feature = "zstd")]
                                 self.decoder_dict.as_ref(),
+                                &keys::aad_page_group(gid),
                                 self.encryption_key.as_ref(),
                             ) {
                                 cache.write_pages_scattered(&pages_in_group, &bulk_data, gid, 0)?;
@@ -1286,6 +1534,7 @@ impl DatabaseHandle for TurboliteHandle {
                                                     &ovr_data,
                                                     #[cfg(feature = "zstd")]
                                                     self.decoder_dict.as_ref(),
+                                                    &keys::aad_override_frame(gid, frame_idx),
                                                     self.encryption_key.as_ref(),
                                                 ) {
                                                     let frame_start = frame_idx * spf;
@@ -1338,7 +1587,14 @@ impl DatabaseHandle for TurboliteHandle {
             self.detect_interior_page(buf, page_num, cache);
             cache.touch_group(gid);
             self.reset_misses(current_tree_name.as_ref());
-            cache.stat_misses.fetch_sub(1, Ordering::Relaxed);
+            // Undo the miss counted at step 4 now that a sibling prefetch made
+            // the page present. Saturating CAS: never wrap past zero if the
+            // miss was already reconciled on another thread.
+            let _ = cache
+                .stat_misses
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |m| {
+                    Some(m.saturating_sub(1))
+                });
             cache.stat_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
@@ -1439,10 +1695,19 @@ impl DatabaseHandle for TurboliteHandle {
                         Ok(Some(compressed_frame)) => {
                             let s3_ms = s3_start.elapsed().as_millis();
                             let decode_start = Instant::now();
+                            // The fetched frame is an override frame when
+                            // override_entry is set, otherwise a base seekable
+                            // page-group frame — bind to the matching slot AAD.
+                            let frame_aad = if override_entry.is_some() {
+                                keys::aad_override_frame(gid, frame_idx)
+                            } else {
+                                keys::aad_page_group(gid)
+                            };
                             let decompressed = decode_seekable_subchunk(
                                 &compressed_frame,
                                 #[cfg(feature = "zstd")]
                                 self.decoder_dict.as_ref(),
+                                &frame_aad,
                                 self.encryption_key.as_ref(),
                             )?;
                             let decode_ms = decode_start.elapsed().as_millis();
@@ -1593,6 +1858,7 @@ impl DatabaseHandle for TurboliteHandle {
                                             0, // not used for scattered writes
                                             #[cfg(feature = "zstd")]
                                             self.decoder_dict.as_ref(),
+                                            &keys::aad_page_group(gid),
                                             self.encryption_key.as_ref(),
                                         )
                                     } else {
@@ -1600,6 +1866,7 @@ impl DatabaseHandle for TurboliteHandle {
                                             &pg_data,
                                             #[cfg(feature = "zstd")]
                                             self.decoder_dict.as_ref(),
+                                            &keys::aad_page_group(gid),
                                             self.encryption_key.as_ref(),
                                         )
                                     };
@@ -1722,7 +1989,17 @@ impl DatabaseHandle for TurboliteHandle {
             let file = self.passthrough_file.as_ref().unwrap().read();
             #[cfg(feature = "encryption")]
             if let Some(ref key) = self.encryption_key {
-                let encrypted = compress::encrypt_ctr(buf, offset, key)?;
+                // Fresh random nonce per write, recorded in the sidecar keyed by
+                // this write's start offset. This is what makes in-place WAL
+                // frame rewrites safe (no keystream reuse). The data file stays
+                // the same size — only the sidecar carries the nonce.
+                let nonce = {
+                    let mut nonces = self.passthrough_nonces.as_ref().unwrap().write();
+                    // record_write appends the nonce to the sidecar log and
+                    // fdatasyncs it before we write the matching ciphertext.
+                    nonces.record_write(offset, buf.len() as u64)?
+                };
+                let encrypted = compress::ctr_xor_at(buf, nonce, 0, key)?;
                 return file.write_all_at(&encrypted, offset);
             }
             return file.write_all_at(buf, offset);
@@ -1818,6 +2095,10 @@ impl DatabaseHandle for TurboliteHandle {
 
         self.dirty_page_nums.write().insert(page_num);
         self.dirty_since_sync = true;
+        // A new write invalidates any prior xSync: the bytes now in the cache
+        // are again speculative until the next xSync makes them durable. The
+        // lock-downgrade flush must not publish them unless xSync fires again.
+        self.synced_since_write = false;
 
         // Update manifest page_count if this page extends the database.
         // Fast path: read lock to check if update is needed (common case: no).
@@ -1878,6 +2159,13 @@ impl DatabaseHandle for TurboliteHandle {
         if self.read_only {
             return Ok(());
         }
+
+        // Record that xSync fired. The lock-downgrade flush gates on this
+        // (not `dirty_since_sync`): only a transaction whose writes were
+        // followed by an xSync is treated as committed/durable and eligible
+        // to publish to S3 on downgrade. Set before the early return so an
+        // xSync with nothing dirty (a no-op commit) still counts.
+        self.synced_since_write = true;
 
         // Snapshot is just page numbers, not page data.
         let dirty_snapshot: HashSet<u64> = {
@@ -2352,6 +2640,7 @@ impl DatabaseHandle for TurboliteHandle {
                                                     0,
                                                     #[cfg(feature = "zstd")]
                                                     None::<&zstd::dict::DecoderDictionary<'static>>,
+                                                    &keys::aad_page_group(gid),
                                                     encryption_key.as_ref(),
                                                 )
                                             {
@@ -2376,6 +2665,7 @@ impl DatabaseHandle for TurboliteHandle {
                                                 &pg_data,
                                                 #[cfg(feature = "zstd")]
                                                 None::<&zstd::dict::DecoderDictionary<'static>>,
+                                                &keys::aad_page_group(gid),
                                                 encryption_key.as_ref(),
                                             )
                                         {
@@ -2413,6 +2703,7 @@ impl DatabaseHandle for TurboliteHandle {
                                 compression_level,
                                 #[cfg(feature = "zstd")]
                                 encoder_dict.as_ref(),
+                                &keys::aad_page_group(gid),
                                 encryption_key.as_ref(),
                             )?;
                             Ok(GroupResult {
@@ -2429,6 +2720,7 @@ impl DatabaseHandle for TurboliteHandle {
                                 compression_level,
                                 #[cfg(feature = "zstd")]
                                 encoder_dict.as_ref(),
+                                &keys::aad_page_group(gid),
                                 encryption_key.as_ref(),
                             )?;
                             Ok(GroupResult {
@@ -2568,6 +2860,7 @@ impl DatabaseHandle for TurboliteHandle {
                         self.compression_level,
                         #[cfg(feature = "zstd")]
                         self.encoder_dict.as_ref(),
+                        &keys::aad_interior_bundle(chunk_id),
                         self.encryption_key.as_ref(),
                     )?;
                     let key = keys::interior_chunk_key(chunk_id, next_version);
@@ -2709,6 +3002,7 @@ impl DatabaseHandle for TurboliteHandle {
                         self.compression_level,
                         #[cfg(feature = "zstd")]
                         self.encoder_dict.as_ref(),
+                        &keys::aad_index_bundle(chunk_id),
                         self.encryption_key.as_ref(),
                     )?;
                     let key = keys::index_chunk_key(chunk_id, next_version);
@@ -2823,27 +3117,22 @@ impl DatabaseHandle for TurboliteHandle {
             let _ = cache.persist_bitmap();
 
             // Truncate cache file if it's larger than current page_count.
-            // After VACUUM, page_count decreases but the sparse cache file retains its old size.
+            // After VACUUM, page_count decreases but the sparse cache file
+            // retains its old size. Use truncate_to_page_count, which (a) sizes
+            // the file by the correct slot stride (widened under encryption) and
+            // (b) clears the bitmap / tracker / index / group-state for pages at
+            // or beyond the new count — a raw set_len left those bits set, so a
+            // fast-path read of a now-out-of-bounds page hit `is_present` and
+            // then read past EOF (IO error). Bump generation so other handles'
+            // fast paths re-validate.
             {
                 let current_page_count = self.manifest.load().page_count;
-                let ps = self.page_size.load(Ordering::Relaxed) as u64;
+                let ps = self.page_size.load(Ordering::Relaxed);
                 if current_page_count > 0 && ps > 0 {
-                    let target_size = current_page_count * ps;
-                    let _guard = cache.cache_file_extend.lock();
-                    if let Ok(meta) = cache.cache_file.metadata() {
-                        if meta.len() > target_size {
-                            if let Err(e) = cache.cache_file.set_len(target_size) {
-                                eprintln!("[sync] WARN: cache truncation failed: {}", e);
-                            } else {
-                                cache.cache_file_len.store(target_size, Ordering::Relaxed);
-                                turbolite_debug!(
-                                    "[sync] cache truncated: {}B -> {}B ({} pages)",
-                                    meta.len(),
-                                    target_size,
-                                    current_page_count
-                                );
-                            }
-                        }
+                    if let Err(e) = cache.truncate_to_page_count(current_page_count, ps) {
+                        eprintln!("[sync] WARN: cache truncation failed: {}", e);
+                    } else {
+                        cache.bump_generation();
                     }
                 }
             }
@@ -2945,13 +3234,32 @@ impl DatabaseHandle for TurboliteHandle {
             (size + page_size as u64 - 1) / page_size as u64
         };
 
+        let old_page_count = self.manifest.load().page_count;
+
         let mut manifest = (**self.manifest.load()).clone();
         manifest.page_count = new_page_count;
         self.manifest.store(Arc::new(manifest));
 
         // Remove dirty pages beyond new size
-        let mut dirty = self.dirty_page_nums.write();
-        dirty.retain(|&pn| pn < new_page_count);
+        {
+            let mut dirty = self.dirty_page_nums.write();
+            dirty.retain(|&pn| pn < new_page_count);
+        }
+
+        // Shrink the cache to match: clear the bitmap / tracker / index for
+        // pages at or beyond the new count and bump generation. Without this a
+        // truncate-then-regrow leaves stale `is_present` bits, so a read of a
+        // regrown page returned the OLD contents from the cache file instead of
+        // zero-fill — silent corruption. truncate_to_page_count handles the
+        // file resize (slot-stride aware under encryption) and bit clearing.
+        if let Some(cache) = &self.cache {
+            if new_page_count < old_page_count {
+                if let Err(e) = cache.truncate_to_page_count(new_page_count, page_size) {
+                    return Err(e);
+                }
+                self.cached_generation = cache.bump_generation();
+            }
+        }
 
         Ok(())
     }
@@ -2975,17 +3283,23 @@ impl DatabaseHandle for TurboliteHandle {
         //   (via xWrite) before releasing the lock, so our dirty set
         //   ends up holding the original (rolled-back) page bytes.
         //
-        // Earlier code treated "lock downgrade without intervening xSync"
-        // as a signal to discard dirty pages (assumed rollback). That
-        // heuristic silently drops every write under
-        // PRAGMA synchronous=OFF, where SQLite skips xSync on every
-        // commit — so each commit looked like a rollback. Replacing the
-        // heuristic with an unconditional sync() keeps both the commit
-        // and rollback cases correct: turbolite's manifest+bitmap end
-        // up matching whatever SQLite finished writing.
-        if (current == LockKind::Exclusive || current == LockKind::Reserved)
+        // Gate the downgrade flush on "xSync fired since the last write"
+        // (`synced_since_write`), NOT "dirty pages exist since last sync"
+        // (`dirty_since_sync`). Under PRAGMA synchronous=OFF, SQLite writes
+        // speculative pages and may then ROLL BACK without ever calling xSync;
+        // those rolled-back bytes set `dirty_since_sync` but were never made
+        // durable. Flushing them on downgrade would publish uncommitted bytes
+        // to S3. Requiring an intervening xSync means only a committed
+        // (durably-synced) transaction publishes here; a rolled-back/aborted
+        // transaction under synchronous=OFF leaves the cache dirty but does
+        // NOT push to S3 — the next genuine commit's xSync will. The source
+        // lock set includes Pending (SQLite escalates Reserved->Pending->
+        // Exclusive, and a transaction can end from any of them).
+        if (current == LockKind::Exclusive
+            || current == LockKind::Reserved
+            || current == LockKind::Pending)
             && (lock == LockKind::Shared || lock == LockKind::None)
-            && self.dirty_since_sync
+            && self.synced_since_write
         {
             if let Err(e) = self.sync(false) {
                 eprintln!("[turbolite] flush-on-lock-downgrade failed: {e}");
