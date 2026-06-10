@@ -70,7 +70,7 @@ rand = "0.8"
 rayon = "1.10"
 
 # Storage abstraction (trait only, concrete backends are picked by consumers).
-hadb-storage = "0.4.0"
+hadb-storage = "0.4.1"
 # LocalStorage is the zero-dep backend used by TurboliteVfs::new. Conceptually a
 # sibling of any other backend; it lives in hadb so other crates can share it.
 hadb-storage-local = "0.4.0"
@@ -81,7 +81,7 @@ libc = "0.2"
 
 # Concrete storage backend for binaries that talk to S3 (CLI, benchmarks).
 # Library code never references this crate.
-hadb-storage-s3 = { version = "0.4.0", optional = true }
+hadb-storage-s3 = { version = "0.4.1", optional = true }
 
 # CLI dependencies
 clap = { version = "4", features = ["derive", "env"] }
