@@ -39,6 +39,11 @@ SPEC_NEGATIVE_STEPS := \
 	badStaleWriterAfterPromotionStep \
 	badPromotionCursorStep \
 	badPromotionPageCountStep
+SPEC_PREFETCH_NEGATIVE_STEPS := \
+	badClaimBeforePermit \
+	badWorkerBlocksBeforePermit \
+	badRangeAndFullDuplicate \
+	badTreeNameGatedScanRange
 
 # ── FFI build passthrough ─────────────────────────────────────────
 
@@ -75,11 +80,14 @@ test-all: ## Run all tests including tiered/S3
 specs-typecheck: ## Typecheck Quint substrate specs
 	$(QUINT) typecheck specs/cursor_chain.qnt
 	$(QUINT) typecheck specs/cursor_chain_liveness.qnt
+	$(QUINT) typecheck specs/cloud_scan_prefetch.qnt
 
 .PHONY: specs
 specs: specs-typecheck ## Run Quint substrate specs (typecheck + simulator invariants)
 	$(QUINT) run specs/cursor_chain.qnt \
 		--max-samples=200 --max-steps=8 --invariants=safety
+	$(QUINT) run specs/cloud_scan_prefetch.qnt \
+		--max-samples=500 --max-steps=8 --invariants=safety --verbosity=0
 
 .PHONY: specs-progress
 specs-progress: specs-typecheck ## Run deterministic Quint progress scenario
@@ -94,6 +102,25 @@ specs-negative: specs-typecheck ## Run Quint specs that are expected to violate 
 		echo "expecting safety violation: $$step"; \
 		if $(QUINT) run specs/cursor_chain.qnt \
 			--max-samples=20 --max-steps=2 --step=$$step \
+			--invariants=safety --verbosity=0 \
+			>"$$out" 2>&1; then \
+			cat "$$out"; \
+			rm -f "$$out"; \
+			echo "expected $$step to violate safety"; \
+			exit 1; \
+		elif ! grep -q "Invariant violated" "$$out"; then \
+			cat "$$out"; \
+			rm -f "$$out"; \
+			echo "expected $$step to fail by violating safety"; \
+			exit 1; \
+		fi; \
+		rm -f "$$out"; \
+	done
+	@for step in $(SPEC_PREFETCH_NEGATIVE_STEPS); do \
+		out=$$(mktemp "$${TMPDIR:-/tmp}/turbolite-quint-$$step.XXXXXX") || exit 1; \
+		echo "expecting safety violation: $$step"; \
+		if $(QUINT) run specs/cloud_scan_prefetch.qnt \
+			--max-samples=20 --max-steps=1 --step=$$step \
 			--invariants=safety --verbosity=0 \
 			>"$$out" 2>&1; then \
 			cat "$$out"; \

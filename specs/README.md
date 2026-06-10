@@ -3,11 +3,18 @@
 These specs model small protocol contracts at the Turbolite/HADB
 boundary. They are not part of the normal Rust build, and they do not
 model SQLite page contents, compression, encryption, object-store
-consistency, or prefetch scheduling.
+consistency, or full object-store behavior. `cloud_scan_prefetch.qnt`
+models the small fixed-window prefetch scheduler contract introduced for
+cloud scan pressure.
 
 The first safety spec is `cursor_chain.qnt`. It models the replay cursor
 base/delta contract: ordered delta application, writer and lease fencing,
 chain anchors, promotion, and fatal ambiguity handling.
+
+`cloud_scan_prefetch.qnt` models the cloud scan scheduler state machine:
+queued optional work, started remote prefetch, foreground full-group
+demand, foreground waits, and scan-range duplication. It intentionally
+does not model SQLite's B-tree traversal or backend retry timing.
 
 ## Tools
 
@@ -39,8 +46,11 @@ This runs:
 ```sh
 npx -y @informalsystems/quint@0.32.0 typecheck specs/cursor_chain.qnt
 npx -y @informalsystems/quint@0.32.0 typecheck specs/cursor_chain_liveness.qnt
+npx -y @informalsystems/quint@0.32.0 typecheck specs/cloud_scan_prefetch.qnt
 npx -y @informalsystems/quint@0.32.0 run specs/cursor_chain.qnt \
   --max-samples=200 --max-steps=8 --invariants=safety
+npx -y @informalsystems/quint@0.32.0 run specs/cloud_scan_prefetch.qnt \
+  --max-samples=500 --max-steps=8 --invariants=safety --verbosity=0
 ```
 
 Expected result: typecheck succeeds, simulator runs without invariant
@@ -152,6 +162,10 @@ violation:
 - `badStaleWriterAfterPromotionStep`
 - `badPromotionCursorStep`
 - `badPromotionPageCountStep`
+- `badClaimBeforePermit`
+- `badWorkerBlocksBeforePermit`
+- `badRangeAndFullDuplicate`
+- `badTreeNameGatedScanRange`
 
 `badChecksumCollisionStep` uses the spec's compact
 `payloadFingerprint` field to stand in for the full production delta
@@ -159,6 +173,15 @@ envelope: changed page bytes, commit boundary, idempotency key, page
 counts, sequence, writer, epoch, and chain link. The model therefore
 checks the intended rule, "one checksum cannot name two different
 payload envelopes," without expanding page bytes in Quint.
+
+The cloud-scan negative steps stand in for the scheduler bugs this
+phase is guarding against: optional work claiming `Fetching` before it
+has a remote I/O permit, optional workers parking behind unavailable
+prefetch permits, and planned SCAN demand doing foreground range I/O
+while also scheduling same-group full prefetch. The tree-name-gated
+negative covers the case where a group is part of a planned SCAN but
+the demand read misses the inferred current tree name and incorrectly
+falls back to seekable range I/O.
 
 For a full counterexample trace, run an individual step without
 `--verbosity=0`, for example:
@@ -185,6 +208,17 @@ npx -y @informalsystems/quint@0.32.0 run specs/cursor_chain.qnt \
   - `publish_replayed_base_with_replay_cursor_anchor`
 - `src/tiered/replay.rs`
   - direct page replay lifecycle
+
+`cloud_scan_prefetch.qnt` models these Rust surfaces:
+
+- `src/tiered/handle.rs`
+  - `ActiveScanPrefetch`
+  - planned SCAN group-membership full demand versus seekable range demand
+  - foreground waits only on started optional prefetch
+- `src/tiered/prefetch.rs`
+  - `PrefetchPool::submit_optional`
+  - `RemoteIoBudget`
+  - queued versus active optional groups
 
 The modeled Rust-facing properties have a matching Rust bridge target:
 
