@@ -564,10 +564,7 @@ mod tests {
 
         // analyze_dead_space should walk only the live 3 pages, not 100.
         let report = analyze_dead_space(
-            &manifest,
-            page_size,
-            &read_page,
-            0.0, // threshold 0 so empty results are visible
+            &manifest, page_size, &read_page, 0.0, // threshold 0 so empty results are visible
         );
         assert_eq!(report.total_dead, 0);
         assert_eq!(report.total_live, 0);

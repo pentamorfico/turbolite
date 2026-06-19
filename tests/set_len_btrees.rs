@@ -24,7 +24,10 @@ fn unique_vfs_name(label: &str) -> String {
 
 /// Import a local SQLite file into a MemStorage-backed TurboliteVFS and return
 /// the VFS plus the imported page size.
-fn import_local_db(dir: &std::path::Path, backend: Arc<dyn StorageBackend>) -> (SharedTurboliteVfs, u32) {
+fn import_local_db(
+    dir: &std::path::Path,
+    backend: Arc<dyn StorageBackend>,
+) -> (SharedTurboliteVfs, u32) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -33,11 +36,10 @@ fn import_local_db(dir: &std::path::Path, backend: Arc<dyn StorageBackend>) -> (
 
     let local_path = dir.join("source.db");
     let conn = rusqlite::Connection::open(&local_path).unwrap();
-    conn.execute_batch("PRAGMA page_size=4096; PRAGMA journal_mode=WAL;").unwrap();
-    conn.execute_batch(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);",
-    )
-    .unwrap();
+    conn.execute_batch("PRAGMA page_size=4096; PRAGMA journal_mode=WAL;")
+        .unwrap();
+    conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);")
+        .unwrap();
     for i in 0..100 {
         conn.execute(
             "INSERT INTO t (id, v) VALUES (?1, ?2)",
@@ -45,7 +47,8 @@ fn import_local_db(dir: &std::path::Path, backend: Arc<dyn StorageBackend>) -> (
         )
         .unwrap();
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
     let page_size: i64 = conn
         .query_row("PRAGMA page_size", [], |r| r.get(0))
         .unwrap();
@@ -67,7 +70,10 @@ fn import_local_db(dir: &std::path::Path, backend: Arc<dyn StorageBackend>) -> (
     let manifest = import_sqlite_file(&cfg, backend.clone(), rt.handle().clone(), &local_path)
         .expect("import");
     assert!(
-        matches!(manifest.strategy, turbolite::tiered::GroupingStrategy::BTreeAware),
+        matches!(
+            manifest.strategy,
+            turbolite::tiered::GroupingStrategy::BTreeAware
+        ),
         "import should produce BTree-aware grouping"
     );
     let vfs = TurboliteVfs::with_backend(cfg, backend, rt.handle().clone()).expect("vfs");

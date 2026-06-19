@@ -1481,7 +1481,10 @@ fn optional_prefetch_workers_drop_busy_permit_without_claiming_or_hanging() {
     let poll_deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let started = backend.started.load(Ordering::Acquire);
-        assert_eq!(started, 1, "only one optional prefetch may start remote I/O");
+        assert_eq!(
+            started, 1,
+            "only one optional prefetch may start remote I/O"
+        );
         if pool.stats_json()["permit_unavailable"] == 1 {
             break;
         }

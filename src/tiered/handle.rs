@@ -2961,9 +2961,7 @@ impl DatabaseHandle for TurboliteHandle {
             }
             let needs_geometry = {
                 let m = self.manifest.load();
-                m.page_size == 0
-                    || m.pages_per_group == 0
-                    || m.sub_pages_per_frame == 0
+                m.page_size == 0 || m.pages_per_group == 0 || m.sub_pages_per_frame == 0
             };
             if needs_geometry {
                 let mut manifest = (**self.manifest.load()).clone();
@@ -3239,9 +3237,8 @@ impl DatabaseHandle for TurboliteHandle {
                             // (4 bytes big-endian) before re-walking, falling back
                             // to the manifest's stale value if the header is short.
                             let live_page_count = if page0.len() >= 32 {
-                                u32::from_be_bytes([
-                                    page0[28], page0[29], page0[30], page0[31],
-                                ]) as u64
+                                u32::from_be_bytes([page0[28], page0[29], page0[30], page0[31]])
+                                    as u64
                             } else {
                                 manifest.page_count
                             };

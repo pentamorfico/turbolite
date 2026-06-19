@@ -96,7 +96,9 @@ static FLUSH_THREAD_STARTED: AtomicBool = AtomicBool::new(false);
 /// `TurboliteSharedState` to be `Clone`.
 #[cfg(feature = "cli-s3")]
 static BENCH_HANDLES: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<turbolite::tiered::TurboliteSharedState>>>,
+    std::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Arc<turbolite::tiered::TurboliteSharedState>>,
+    >,
 > = std::sync::OnceLock::new();
 
 /// Name of the most recently registered tiered VFS. Existing bench/cache
@@ -114,8 +116,6 @@ fn bench_handles() -> &'static std::sync::Mutex<
 
 #[cfg(feature = "cli-s3")]
 static S3_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-
-
 
 /// Store a tiered VFS's shared state keyed by name and mark it as the most
 /// recently registered tiered VFS.
@@ -1187,6 +1187,9 @@ mod tests {
         .unwrap();
         insert_bench_handle("vfs-b", vfs_b.shared_state());
         assert!(get_bench_handle(Some("vfs-b")).is_some());
-        assert!(get_bench_handle(Some("vfs-a")).is_some(), "earlier handle preserved");
+        assert!(
+            get_bench_handle(Some("vfs-a")).is_some(),
+            "earlier handle preserved"
+        );
     }
 }

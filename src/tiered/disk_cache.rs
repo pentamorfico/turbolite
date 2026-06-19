@@ -2149,7 +2149,9 @@ impl DiskCache {
                 // Lost the race: another thread installed a different buffer.
                 // Drop our unused allocation.
                 unsafe {
-                    drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(new_ptr, ps)));
+                    drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                        new_ptr, ps,
+                    )));
                 }
             }
         }

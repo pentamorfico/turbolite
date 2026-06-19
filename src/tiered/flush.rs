@@ -304,8 +304,7 @@ fn flush_inner(
             // bytes rather than zeros.
             let needs_base = dirty_frames.iter().any(|&frame_idx| {
                 let frame_start = frame_idx * old_sub_ppf as usize;
-                let frame_end =
-                    std::cmp::min(frame_start + old_sub_ppf as usize, group_size);
+                let frame_end = std::cmp::min(frame_start + old_sub_ppf as usize, group_size);
                 (frame_start..frame_end).any(|pos| {
                     let pnum = pages_in_group[pos];
                     pnum < page_count

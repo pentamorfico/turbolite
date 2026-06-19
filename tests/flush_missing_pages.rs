@@ -56,8 +56,11 @@ fn write_rows(vfs_name: &str, count: i64) {
         .expect("schema");
     let tx = conn.unchecked_transaction().unwrap();
     for i in 0..count {
-        tx.execute("INSERT INTO t (id, v) VALUES (?1, ?2)", rusqlite::params![i, i * 10])
-            .unwrap();
+        tx.execute(
+            "INSERT INTO t (id, v) VALUES (?1, ?2)",
+            rusqlite::params![i, i * 10],
+        )
+        .unwrap();
     }
     tx.commit().unwrap();
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
@@ -68,8 +71,11 @@ fn update_row(vfs_name: &str, id: i64, v: i64) {
     let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE;
     let conn =
         rusqlite::Connection::open_with_flags_and_vfs("missing.db", flags, vfs_name).expect("open");
-    conn.execute("UPDATE t SET v = ?1 WHERE id = ?2", rusqlite::params![v, id])
-        .expect("update");
+    conn.execute(
+        "UPDATE t SET v = ?1 WHERE id = ?2",
+        rusqlite::params![v, id],
+    )
+    .expect("update");
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .expect("ckpt");
 }

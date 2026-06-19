@@ -101,8 +101,8 @@ pub fn decompress(data: &[u8], _: Option<&()>) -> io::Result<Vec<u8>> {
 #[cfg(all(feature = "lz4", not(feature = "zstd")))]
 pub fn decompress_capped(data: &[u8], _: Option<&()>, max_len: usize) -> io::Result<Vec<u8>> {
     use lz4_flex::block::uncompressed_size;
-    let (declared, _) = uncompressed_size(data)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let (declared, _) =
+        uncompressed_size(data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     if declared > max_len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

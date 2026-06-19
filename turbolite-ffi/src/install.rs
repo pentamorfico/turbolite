@@ -230,7 +230,8 @@ pub unsafe extern "C" fn turbolite_install_config_functions(db: *mut sqlite3) ->
             // drop it so the queue is freed.
             let _ = unsafe {
                 Arc::from_raw(
-                    queue as *const std::sync::Mutex<Vec<turbolite::tiered::settings::SettingUpdate>>,
+                    queue
+                        as *const std::sync::Mutex<Vec<turbolite::tiered::settings::SettingUpdate>>,
                 )
             };
         }

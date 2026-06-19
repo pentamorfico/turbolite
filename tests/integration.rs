@@ -254,8 +254,7 @@ fn test_passthrough_encryption_nonce_sidecar() {
     {
         let conn = Connection::open_with_flags_and_vfs(
             &db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
             "passthrough_enc_test",
         )
         .unwrap();
@@ -284,7 +283,8 @@ fn test_passthrough_encryption_nonce_sidecar() {
         );
 
         // WAL frame rewrites (checkpoint) must not reuse a keystream nonce.
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
@@ -975,12 +975,7 @@ fn test_import_refuses_locked_source_file() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let handle = runtime.handle().clone();
 
-    let result = turbolite::tiered::import_sqlite_file(
-        &config,
-        backend,
-        handle,
-        db_path.as_path(),
-    );
+    let result = turbolite::tiered::import_sqlite_file(&config, backend, handle, db_path.as_path());
 
     assert!(
         result.is_err(),

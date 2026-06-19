@@ -2599,7 +2599,11 @@ fn test_mem_cache_no_torn_reads() {
     let cache_w = cache.clone();
     let writer = std::thread::spawn(move || {
         for i in 0..10_000usize {
-            let page = if i % 2 == 0 { [0xAAu8; 64] } else { [0xBBu8; 64] };
+            let page = if i % 2 == 0 {
+                [0xAAu8; 64]
+            } else {
+                [0xBBu8; 64]
+            };
             cache_w.write_page(0, &page).unwrap();
         }
     });
@@ -2630,9 +2634,7 @@ fn test_mem_cache_no_torn_reads() {
 #[test]
 fn test_evict_install_no_zero_pages() {
     let dir = TempDir::new().unwrap();
-    let cache = Arc::new(
-        DiskCache::new(dir.path(), 3600, 4, 2, 64, 4, None, Vec::new()).unwrap(),
-    );
+    let cache = Arc::new(DiskCache::new(dir.path(), 3600, 4, 2, 64, 4, None, Vec::new()).unwrap());
 
     // Seed page 0 with non-zero data so it is present.
     cache.write_page(0, &[0xAAu8; 64]).unwrap();
@@ -2693,7 +2695,6 @@ fn test_evict_install_no_zero_pages() {
     reader.join().unwrap();
 }
 
-
 // =========================================================================
 // P3 DiskCache regression tests
 // =========================================================================
@@ -2740,7 +2741,11 @@ fn test_mem_cache_sized_to_budget_not_page_count() {
     // the fix sizes it to 128/64 = 2 slots.
     let cache = cache_with_mem_budget(dir.path(), 64, 1000, 128);
     if let Some(ref mc) = cache.mem_cache {
-        assert_eq!(mc.read().len(), 2, "mem_cache capacity should be budget/page_size");
+        assert_eq!(
+            mc.read().len(),
+            2,
+            "mem_cache capacity should be budget/page_size"
+        );
     } else {
         panic!("mem_cache should be enabled");
     }
@@ -3014,8 +3019,13 @@ fn test_write_pages_scattered_only_marks_full_pages() {
     let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None, Vec::new()).unwrap();
     let page_nums = vec![0u64, 5];
     let data = vec![0xAA; 64]; // 1 page, claims 2
-    cache.write_pages_scattered(&page_nums, &data, 0, 0).unwrap();
-    assert!(cache.is_present(0), "page 0 with full data should be present");
+    cache
+        .write_pages_scattered(&page_nums, &data, 0, 0)
+        .unwrap();
+    assert!(
+        cache.is_present(0),
+        "page 0 with full data should be present"
+    );
     assert!(
         !cache.bitmap.read().is_present(5),
         "page 5 with no data should not be present"

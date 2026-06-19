@@ -888,7 +888,11 @@ mod tests {
         pos += rowid_len;
         // local payload + overflow pointer
         let surplus = min_local + (payload_size as usize - min_local) % (usable - 4);
-        let local_size = if surplus <= max_local { surplus } else { min_local };
+        let local_size = if surplus <= max_local {
+            surplus
+        } else {
+            min_local
+        };
         pos += local_size;
         // overflow pointer: page 100 (1-based)
         leaf[pos..pos + 4].copy_from_slice(&100u32.to_be_bytes());
@@ -899,9 +903,7 @@ mod tests {
                 .into_iter()
                 .collect();
 
-        let result = walk_all_btrees(2, page_size, &|pnum| {
-            pages.get(&pnum).cloned()
-        });
+        let result = walk_all_btrees(2, page_size, &|pnum| pages.get(&pnum).cloned());
 
         let btree = result.btrees.get(&0).expect("sqlite_master btree");
         // The out-of-bounds overflow page must NOT appear in the btree pages.

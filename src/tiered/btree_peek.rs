@@ -733,7 +733,10 @@ mod tests {
 
         let parsed = parse_index_leaf_rowids(&page, false, 64, None);
         assert!(parsed.rowids.is_empty());
-        assert_eq!(parsed.malformed_cells, 1, "truncated cell must be malformed");
+        assert_eq!(
+            parsed.malformed_cells, 1,
+            "truncated cell must be malformed"
+        );
         assert_eq!(parsed.overflow_cells, 0, "truncation is not overflow");
     }
 }

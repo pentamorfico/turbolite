@@ -1963,7 +1963,10 @@ impl PrefetchPool {
             };
             // Sleep until a worker rings the bell, or 50ms — whichever first.
             // Either way we re-check in_flight on the next iteration.
-            match self.done_rx.recv_timeout(timeout.min(Duration::from_millis(50))) {
+            match self
+                .done_rx
+                .recv_timeout(timeout.min(Duration::from_millis(50)))
+            {
                 Ok(_gid) => {}
                 Err(flume::RecvTimeoutError::Timeout) => {}
                 Err(flume::RecvTimeoutError::Disconnected) => return true,

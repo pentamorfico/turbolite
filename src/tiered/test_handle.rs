@@ -438,7 +438,9 @@ fn planned_scan_read_path_does_not_submit_current_group_to_optional_window() {
     let data: Vec<u8> = (0..pages_per_group)
         .flat_map(|i| vec![i as u8; page_size as usize])
         .collect();
-    cache.write_pages_scattered(&page_nums, &data, 0, 0).unwrap();
+    cache
+        .write_pages_scattered(&page_nums, &data, 0, 0)
+        .unwrap();
     cache.mark_group_present(0);
     // Force the slow path so the plan queue is drained and SCAN prefetch
     // state is populated; otherwise the fast path returns before touching it.
@@ -2784,4 +2786,3 @@ fn end_of_query_clears_prefetch_state() {
         "last_scan_refill_gid must be cleared at end of query"
     );
 }
-

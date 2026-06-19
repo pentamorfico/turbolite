@@ -728,9 +728,7 @@ fn recovery_skips_staging_log_with_mismatched_page_size() {
     // Drop a staging log whose header claims 8192-byte pages and a stray high page.
     let staging_dir = cache_dir.join("staging");
     let mut writer = super::staging::StagingWriter::open(&staging_dir, 1, 8192).unwrap();
-    writer
-        .append(99, &vec![0xBBu8; 8192])
-        .unwrap();
+    writer.append(99, &vec![0xBBu8; 8192]).unwrap();
     writer.finalize().unwrap();
 
     let config = TurboliteConfig {
@@ -752,16 +750,12 @@ fn recovery_caps_page_count_to_adopted_trailer() {
 
     // Older log contains a stray page far above the committed length.
     let mut older = super::staging::StagingWriter::open(&staging_dir, 0, page_size).unwrap();
-    older
-        .append(99, &vec![0xAAu8; page_size as usize])
-        .unwrap();
+    older.append(99, &vec![0xAAu8; page_size as usize]).unwrap();
     older.finalize().unwrap();
 
     // Newer log carries a manifest trailer pinning the committed length at 10 pages.
     let mut newer = super::staging::StagingWriter::open(&staging_dir, 1, page_size).unwrap();
-    newer
-        .append(3, &vec![0xCCu8; page_size as usize])
-        .unwrap();
+    newer.append(3, &vec![0xCCu8; page_size as usize]).unwrap();
     let trailer = {
         let mut m = Manifest::empty();
         m.version = 1;

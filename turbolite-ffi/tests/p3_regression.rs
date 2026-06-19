@@ -15,8 +15,9 @@ fn trace_push_plan_null_sql_does_not_unwind() {
 
 #[test]
 fn trace_end_query_does_not_unwind() {
-    let result =
-        panic::catch_unwind(AssertUnwindSafe(|| turbolite_ffi::turbolite_trace_end_query()));
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        turbolite_ffi::turbolite_trace_end_query()
+    }));
     assert!(result.is_ok(), "end_query must not unwind");
 }
 
@@ -52,10 +53,7 @@ fn register_local_file_first_nulls_are_safe() {
 #[test]
 fn ext_register_named_vfs_rejects_null() {
     let result = panic::catch_unwind(AssertUnwindSafe(|| unsafe {
-        turbolite_ffi::ext::turbolite_ext_register_named_vfs(
-            std::ptr::null(),
-            std::ptr::null(),
-        )
+        turbolite_ffi::ext::turbolite_ext_register_named_vfs(std::ptr::null(), std::ptr::null())
     }));
     assert!(result.is_ok());
     assert_eq!(result.unwrap(), 1);

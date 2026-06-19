@@ -527,6 +527,9 @@ mod tests {
         f.sync_all().unwrap();
 
         let pages = read_staging_log(&path, 64).unwrap();
-        assert!(pages.is_empty(), "non-power-of-two page_size must be rejected");
+        assert!(
+            pages.is_empty(),
+            "non-power-of-two page_size must be rejected"
+        );
     }
 }

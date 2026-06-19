@@ -1729,11 +1729,8 @@ impl TurboliteVfs {
                 .create(true)
                 .truncate(false)
                 .open(&path)?;
-            let mut handle = TurboliteHandle::new_passthrough(
-                file,
-                path,
-                self.config.encryption.key,
-            );
+            let mut handle =
+                TurboliteHandle::new_passthrough(file, path, self.config.encryption.key);
             handle.set_flush_lock(self.flush_lock.clone());
             Ok(handle)
         }

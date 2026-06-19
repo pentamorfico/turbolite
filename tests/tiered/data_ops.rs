@@ -974,8 +974,7 @@ fn test_vacuum_updates_manifest_page_count() {
         .unwrap();
     assert!(pages_before > 1, "expected multiple pages before VACUUM");
 
-    conn.execute("DELETE FROM pc WHERE id >= 200", [])
-        .unwrap();
+    conn.execute("DELETE FROM pc WHERE id >= 200", []).unwrap();
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .unwrap();
     conn.execute_batch("VACUUM;").unwrap();
@@ -999,18 +998,14 @@ fn test_vacuum_updates_manifest_page_count() {
     // Re-acquire the VFS instance via a new clone of the shared state is not
     // exposed, but the manifest was updated in place by sync(). Inspect it
     // through the local manifest file.
-    let manifest_path = cache_dir
-        .path()
-        .join("manifest.msgpack");
+    let manifest_path = cache_dir.path().join("manifest.msgpack");
     if manifest_path.exists() {
         let bytes = std::fs::read(&manifest_path).unwrap();
         let manifest: Manifest = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(
-            manifest.page_count,
-            pages_after as u64,
+            manifest.page_count, pages_after as u64,
             "manifest page_count {} should match live page count {}",
-            manifest.page_count,
-            pages_after
+            manifest.page_count, pages_after
         );
     }
 }

@@ -99,30 +99,27 @@ fn shared_runtime() -> &'static tokio::runtime::Runtime {
 }
 
 fn insert_handle(conn: rusqlite::Connection) -> *mut TurboliteDb {
-    let mut slot = handle_table()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut slot = handle_table().lock().unwrap_or_else(|e| e.into_inner());
     let id = slot.next_id;
     slot.next_id += 1;
-    slot.handles.insert(id, Arc::new(TurboliteDb {
-        conn: Mutex::new(conn),
-    }));
+    slot.handles.insert(
+        id,
+        Arc::new(TurboliteDb {
+            conn: Mutex::new(conn),
+        }),
+    );
     id as *mut TurboliteDb
 }
 
 fn lookup_handle(id: usize) -> Option<Arc<TurboliteDb>> {
-    let slot = handle_table()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let slot = handle_table().lock().unwrap_or_else(|e| e.into_inner());
     slot.handles.get(&(id as u64)).cloned()
 }
 
 /// Remove the handle from the table. Returns `true` if the handle existed and
 /// was removed (this call owns the drop); `false` if it was already closed.
 fn remove_handle(id: usize) -> bool {
-    let mut slot = handle_table()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut slot = handle_table().lock().unwrap_or_else(|e| e.into_inner());
     slot.handles.remove(&(id as u64)).is_some()
 }
 
@@ -544,9 +541,9 @@ pub extern "C" fn turbolite_register_cloud(
         // kept alive instead of leaking one per registration.
         let runtime = shared_runtime();
         let handle = runtime.handle().clone();
-        let backend = match handle.block_on(async {
-            build_s3_storage(bucket, prefix, endpoint_url, region).await
-        }) {
+        let backend = match handle
+            .block_on(async { build_s3_storage(bucket, prefix, endpoint_url, region).await })
+        {
             Ok(b) => std::sync::Arc::new(b) as std::sync::Arc<dyn hadb_storage::StorageBackend>,
             Err(e) => {
                 set_last_error(&format!("S3Storage: {}", e));
@@ -743,10 +740,7 @@ pub extern "C" fn turbolite_exec(db: *mut TurboliteDb, sql: *const c_char) -> c_
 /// `db` must be a live handle from `turbolite_open` (not yet closed), and `sql`
 /// a valid NUL-terminated C string.
 #[no_mangle]
-pub extern "C" fn turbolite_query_json(
-    db: *mut TurboliteDb,
-    sql: *const c_char,
-) -> *mut c_char {
+pub extern "C" fn turbolite_query_json(db: *mut TurboliteDb, sql: *const c_char) -> *mut c_char {
     ffi_guard(std::ptr::null_mut(), || {
         clear_last_error();
         if db.is_null() {
@@ -767,9 +761,7 @@ pub extern "C" fn turbolite_query_json(
 
         let result = (|| -> Result<String, String> {
             let conn = db.conn.lock().unwrap_or_else(|e| e.into_inner());
-            let mut stmt = conn
-                .prepare(sql)
-                .map_err(|e| format!("prepare: {}", e))?;
+            let mut stmt = conn.prepare(sql).map_err(|e| format!("prepare: {}", e))?;
             let col_count = stmt.column_count();
             let col_names: Vec<String> = (0..col_count)
                 .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
