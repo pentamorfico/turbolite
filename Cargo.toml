@@ -100,7 +100,7 @@ lambda_runtime = { version = "0.13", optional = true }
 
 # WAL replication via walrust's core crate (optional). Use the git source until
 # the crate.io release exposes the sink/snapshot APIs Turbolite needs.
-walrust-core = { git = "https://github.com/russellromney/walrust.git", version = "0.3.1", optional = true, package = "walrust", branch = "hoist-public-deps" }
+walrust-core = { git = "https://github.com/russellromney/walrust.git", version = "0.3.1", optional = true, package = "walrust", branch = "turbolite-hadb-041" }
 
 rmp-serde = "1.3.1"
 
@@ -187,26 +187,15 @@ cc = "1"
 [profile.release]
 panic = "abort"
 
-# Development patches: turbolite is developed alongside the sibling `hadb` and
-# `walrust` repositories. `cinch-cloud` already applies these same patches; adding
-# them here makes `turbolite` standalone builds resolve to the same local sources
-# so `--all-features` (which pulls in the walrust-backed WAL replication feature)
-# compiles against a consistent hadb-storage trait instead of mixing the git
-# 0.4.0 source with the crates.io 0.4.1 source.
+# `walrust-core` is pulled from a git branch whose `hadb-changeset` crate has
+# a path dependency on the git-source `hadb-storage`. The rest of the workspace
+# uses the published `hadb-storage` 0.4.1 crate. Without unification that
+# produces two copies of the `hadb_storage::StorageBackend` trait and
+# `--all-features` fails with "the trait `StorageBackend` is not implemented for
+# `S3Storage`". Override the git-source `hadb-storage` with the crates.io
+# release so the whole workspace resolves to one trait definition.
 [patch."https://github.com/russellromney/hadb.git"]
-hadb-changeset = { path = "../hadb/hadb-changeset" }
-hadb-io = { path = "../hadb/hadb-io" }
-hadb-storage = { path = "../hadb/hadb-storage" }
-hadb-storage-s3 = { path = "../hadb/hadb-storage-s3" }
-
-[patch.crates-io]
-hadb-storage = { path = "../hadb/hadb-storage" }
-hadb-storage-local = { path = "../hadb/hadb-storage-local" }
-hadb-storage-s3 = { path = "../hadb/hadb-storage-s3" }
-hadb-storage-mem = { path = "../hadb/hadb-storage-mem" }
-
-[patch."https://github.com/russellromney/walrust.git"]
-walrust = { path = "../walrust/crates/walrust-core" }
+hadb-storage = "0.4.1"
 
 [[example]]
 name = "quick-bench"
