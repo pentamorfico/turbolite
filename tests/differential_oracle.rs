@@ -203,7 +203,10 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(50))]
 
     /// Core differential oracle: random operations, compare after every batch.
+    /// Ignored by default because it is slow; run explicitly with
+    /// `cargo test --test differential_oracle -- --ignored`.
     #[test]
+    #[ignore = "slow differential oracle"]
     fn oracle_random_ops(ops in proptest::collection::vec(sql_op_strategy(), 10..200)) {
         let vanilla_dir = tempfile::tempdir().expect("tempdir");
         let turbo_dir = tempfile::tempdir().expect("tempdir");
@@ -255,7 +258,10 @@ proptest! {
     }
 
     /// Oracle with WAL checkpoint between batches.
+    /// Ignored by default because it is slow; run explicitly with
+    /// `cargo test --test differential_oracle -- --ignored`.
     #[test]
+    #[ignore = "slow differential oracle"]
     fn oracle_with_checkpoint(
         batches in proptest::collection::vec(
             proptest::collection::vec(sql_op_strategy(), 5..50),

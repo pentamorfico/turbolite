@@ -1475,9 +1475,9 @@ fn optional_prefetch_workers_drop_busy_permit_without_claiming_or_hanging() {
         std::thread::sleep(Duration::from_millis(1));
     }
     // The second worker is racing to discover that the single prefetch I/O
-    // permit is already held. Poll until that observation is recorded rather
-    // than assuming a fixed 25 ms sleep is enough under heavy default-thread
-    // parallelism.
+    // permit is already held. Poll until that observation is recorded and the
+    // worker has dropped its group claim, rather than assuming a fixed sleep
+    // is enough under heavy default-thread parallelism.
     let poll_deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let started = backend.started.load(Ordering::Acquire);
@@ -1485,7 +1485,9 @@ fn optional_prefetch_workers_drop_busy_permit_without_claiming_or_hanging() {
             started, 1,
             "only one optional prefetch may start remote I/O"
         );
-        if pool.stats_json()["permit_unavailable"] == 1 {
+        if pool.stats_json()["permit_unavailable"] == 1
+            && cache.group_state(1) == GroupState::None
+        {
             break;
         }
         assert!(
