@@ -60,3 +60,29 @@ jobs:
 
       - name: Run Go FFI tests
         run: make -C turbolite-ffi test-ffi-go
+
+  specs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Typecheck and simulate Quint specs
+        run: make specs
+      - name: Expected-failure counterexamples
+        run: make specs-negative
+      - name: Deterministic progress scenarios
+        run: make specs-progress
+
+  all-features:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install libclang (sqlite-plugin bindgen)
+        run: sudo apt-get update && sudo apt-get install -y llvm-dev libclang-dev clang
+      - name: Check all features compile
+        run: cargo check --all-features
+      - name: Clippy all features
+        run: cargo clippy --all-features -- -D warnings

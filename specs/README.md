@@ -22,6 +22,21 @@ rejects the upload if the remote version is already >= the local version.
 The model tracks only the version counter and the writer's local view; it
 does not model page groups, chain anchors, or object-store semantics.
 
+`flush_ordering.qnt` models the two-phase flush persistence contract from
+PR #46: the new manifest is uploaded to the backend, the local manifest is
+persisted, the dirty-groups file is cleared, and only then is the in-memory
+shared manifest advanced. The safety property is that `shared_manifest`
+never runs ahead of the persisted local manifest.
+
+`dirty_page_read.qnt` models the dirty-page read TOCTOU fix from PR #46:
+if a dirty page is evicted from the disk cache before a read completes,
+the read must fail hard rather than return zeros or stale backend data.
+
+`mem_cache_epoch.qnt` models the crossbeam-epoch memory reclamation contract
+for the in-memory page cache, also introduced in PR #46. A reader pins an
+epoch while copying; an installer/evictor retires the old buffer through
+the epoch collector; the buffer is only freed after all readers unpin.
+
 ## Tools
 
 Use Quint 0.32.0 through `npx`:
@@ -54,11 +69,20 @@ npx -y @informalsystems/quint@0.32.0 typecheck specs/cursor_chain.qnt
 npx -y @informalsystems/quint@0.32.0 typecheck specs/cursor_chain_liveness.qnt
 npx -y @informalsystems/quint@0.32.0 typecheck specs/cloud_scan_prefetch.qnt
 npx -y @informalsystems/quint@0.32.0 typecheck specs/manifest_cas.qnt
+npx -y @informalsystems/quint@0.32.0 typecheck specs/flush_ordering.qnt
+npx -y @informalsystems/quint@0.32.0 typecheck specs/dirty_page_read.qnt
+npx -y @informalsystems/quint@0.32.0 typecheck specs/mem_cache_epoch.qnt
 npx -y @informalsystems/quint@0.32.0 run specs/cursor_chain.qnt \
   --max-samples=200 --max-steps=8 --invariants=safety
 npx -y @informalsystems/quint@0.32.0 run specs/cloud_scan_prefetch.qnt \
   --max-samples=500 --max-steps=8 --invariants=safety --verbosity=0
 npx -y @informalsystems/quint@0.32.0 run specs/manifest_cas.qnt \
+  --max-samples=500 --max-steps=8 --invariants=safety --verbosity=0
+npx -y @informalsystems/quint@0.32.0 run specs/flush_ordering.qnt \
+  --max-samples=500 --max-steps=8 --invariants=safety --verbosity=0
+npx -y @informalsystems/quint@0.32.0 run specs/dirty_page_read.qnt \
+  --max-samples=500 --max-steps=8 --invariants=safety --verbosity=0
+npx -y @informalsystems/quint@0.32.0 run specs/mem_cache_epoch.qnt \
   --max-samples=500 --max-steps=8 --invariants=safety --verbosity=0
 ```
 
@@ -177,6 +201,12 @@ violation:
 - `badTreeNameGatedScanRange`
 - `badSkipCasOnFirstWrite`
 - `badBlindOverwrite`
+- `badSharedBeforeLocal`
+- `badNoLocalPersist`
+- `badReadEvictedAsSuccess`
+- `badEvictedToClean`
+- `badFreeWithActiveReaders`
+- `badReadAfterFree`
 
 `badChecksumCollisionStep` uses the spec's compact
 `payloadFingerprint` field to stand in for the full production delta
@@ -199,6 +229,21 @@ The manifest-CAS negative steps model the regression PR #46 closed.
 for version 1 skipped the remote version check and could overwrite an
 already-published manifest. `badBlindOverwrite` represents publishing
 without reading the remote manifest at all.
+
+The flush-ordering negative steps model incorrect commit ordering.
+`badSharedBeforeLocal` updates the in-memory shared manifest before the
+local manifest is persisted. `badNoLocalPersist` clears the dirty flag and
+updates shared state without ever persisting the local manifest.
+
+The dirty-page-read negative steps model the old TOCTOU bug.
+`badReadEvictedAsSuccess` returns a successful read for an evicted dirty
+page. `badEvictedToClean` silently transitions an evicted dirty page back
+to Clean, losing the unflushed write.
+
+The mem-cache-epoch negative steps model incorrect memory reclamation.
+`badFreeWithActiveReaders` frees a retired buffer while a reader is still
+copying. `badReadAfterFree` starts a new read after the buffer has already
+been freed.
 
 For a full counterexample trace, run an individual step without
 `--verbosity=0`, for example:
@@ -243,6 +288,34 @@ npx -y @informalsystems/quint@0.32.0 run specs/cursor_chain.qnt \
   - `put_manifest`
   - the remote manifest version check that rejects uploads when
     `remote.version >= local.version`
+
+`flush_ordering.qnt` models these Rust surfaces:
+
+- `src/tiered/flush.rs`
+  - `flush_dirty_groups` / `flush_inner`
+  - ordering of `storage_helpers::put_manifest`,
+    `manifest::persist_manifest_local`, `manifest::persist_dirty_groups`,
+    and the final `shared_manifest.store`
+- `src/tiered/manifest.rs`
+  - `persist_manifest_local`
+  - `persist_dirty_groups`
+
+`dirty_page_read.qnt` models these Rust surfaces:
+
+- `src/tiered/handle.rs`
+  - `read_page_if_present`
+  - dirty-page read failure when the page was evicted between the dirty
+    check and the read
+- `src/tiered/flush.rs`
+  - page gathering for override frames and full rewrites
+
+`mem_cache_epoch.qnt` models these Rust surfaces:
+
+- `src/tiered/disk_cache.rs`
+  - `read_page` epoch pin around pointer load+copy
+  - `install_mem_cache_page`, `evict_to_budget`,
+    `clear_pages_from_mem_cache`, `resize_mem_cache`
+  - `Guard::defer` retirement of evicted buffers via `crossbeam-epoch`
 
 The modeled Rust-facing properties have a matching Rust bridge target:
 

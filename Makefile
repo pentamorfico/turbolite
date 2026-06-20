@@ -47,6 +47,15 @@ SPEC_PREFETCH_NEGATIVE_STEPS := \
 SPEC_MANIFEST_CAS_NEGATIVE_STEPS := \
 	badSkipCasOnFirstWrite \
 	badBlindOverwrite
+SPEC_FLUSH_ORDERING_NEGATIVE_STEPS := \
+	badSharedBeforeLocal \
+	badNoLocalPersist
+SPEC_DIRTY_PAGE_READ_NEGATIVE_STEPS := \
+	badReadEvictedAsSuccess \
+	badEvictedToClean
+SPEC_MEM_CACHE_EPOCH_NEGATIVE_STEPS := \
+	badFreeWithActiveReaders \
+	badReadAfterFree
 
 # ── FFI build passthrough ─────────────────────────────────────────
 
@@ -85,6 +94,9 @@ specs-typecheck: ## Typecheck Quint substrate specs
 	$(QUINT) typecheck specs/cursor_chain_liveness.qnt
 	$(QUINT) typecheck specs/cloud_scan_prefetch.qnt
 	$(QUINT) typecheck specs/manifest_cas.qnt
+	$(QUINT) typecheck specs/flush_ordering.qnt
+	$(QUINT) typecheck specs/dirty_page_read.qnt
+	$(QUINT) typecheck specs/mem_cache_epoch.qnt
 
 .PHONY: specs
 specs: specs-typecheck ## Run Quint substrate specs (typecheck + simulator invariants)
@@ -93,6 +105,12 @@ specs: specs-typecheck ## Run Quint substrate specs (typecheck + simulator invar
 	$(QUINT) run specs/cloud_scan_prefetch.qnt \
 		--max-samples=500 --max-steps=8 --invariants=safety --verbosity=0
 	$(QUINT) run specs/manifest_cas.qnt \
+		--max-samples=500 --max-steps=8 --invariants=safety --verbosity=0
+	$(QUINT) run specs/flush_ordering.qnt \
+		--max-samples=500 --max-steps=8 --invariants=safety --verbosity=0
+	$(QUINT) run specs/dirty_page_read.qnt \
+		--max-samples=500 --max-steps=8 --invariants=safety --verbosity=0
+	$(QUINT) run specs/mem_cache_epoch.qnt \
 		--max-samples=500 --max-steps=8 --invariants=safety --verbosity=0
 
 .PHONY: specs-progress
@@ -160,6 +178,63 @@ specs-negative: specs-typecheck ## Run Quint specs that are expected to violate 
 		fi; \
 		rm -f "$$out"; \
 	done
+	@for step in $(SPEC_FLUSH_ORDERING_NEGATIVE_STEPS); do \
+		out=$$(mktemp "$${TMPDIR:-/tmp}/turbolite-quint-$$step.XXXXXX") || exit 1; \
+		echo "expecting safety violation: $$step"; \
+		if $(QUINT) run specs/flush_ordering.qnt \
+			--max-samples=20 --max-steps=2 --step=$$step \
+			--invariants=safety --verbosity=0 \
+			>"$$out" 2>&1; then \
+			cat "$$out"; \
+			rm -f "$$out"; \
+			echo "expected $$step to violate safety"; \
+			exit 1; \
+		elif ! grep -q "Invariant violated" "$$out"; then \
+			cat "$$out"; \
+			rm -f "$$out"; \
+			echo "expected $$step to fail by violating safety"; \
+			exit 1; \
+		fi; \
+		rm -f "$$out"; \
+	done
+	@for step in $(SPEC_DIRTY_PAGE_READ_NEGATIVE_STEPS); do \
+		out=$$(mktemp "$${TMPDIR:-/tmp}/turbolite-quint-$$step.XXXXXX") || exit 1; \
+		echo "expecting safety violation: $$step"; \
+		if $(QUINT) run specs/dirty_page_read.qnt \
+			--max-samples=20 --max-steps=2 --step=$$step \
+			--invariants=safety --verbosity=0 \
+			>"$$out" 2>&1; then \
+			cat "$$out"; \
+			rm -f "$$out"; \
+			echo "expected $$step to violate safety"; \
+			exit 1; \
+		elif ! grep -q "Invariant violated" "$$out"; then \
+			cat "$$out"; \
+			rm -f "$$out"; \
+			echo "expected $$step to fail by violating safety"; \
+			exit 1; \
+		fi; \
+		rm -f "$$out"; \
+	done
+	@for step in $(SPEC_MEM_CACHE_EPOCH_NEGATIVE_STEPS); do \
+		out=$$(mktemp "$${TMPDIR:-/tmp}/turbolite-quint-$$step.XXXXXX") || exit 1; \
+		echo "expecting safety violation: $$step"; \
+		if $(QUINT) run specs/mem_cache_epoch.qnt \
+			--max-samples=20 --max-steps=2 --step=$$step \
+			--invariants=safety --verbosity=0 \
+			>"$$out" 2>&1; then \
+			cat "$$out"; \
+			rm -f "$$out"; \
+			echo "expected $$step to violate safety"; \
+			exit 1; \
+		elif ! grep -q "Invariant violated" "$$out"; then \
+			cat "$$out"; \
+			rm -f "$$out"; \
+			echo "expected $$step to fail by violating safety"; \
+			exit 1; \
+		fi; \
+		rm -f "$$out"; \
+	done
 
 .PHONY: specs-all
 specs-all: specs specs-progress specs-negative specs-rust specs-verify specs-liveness specs-liveness-negative ## Run all local spec checks
@@ -171,6 +246,12 @@ specs-verify: specs-typecheck ## Run Quint bounded model checker (requires Java)
 	PATH="$(JAVA_PATH_PREFIX)$$PATH" $(QUINT) verify specs/cursor_chain.qnt \
 		--step=progressStep --max-steps=4 --invariants=safety boundedProgress
 	PATH="$(JAVA_PATH_PREFIX)$$PATH" $(QUINT) verify specs/manifest_cas.qnt \
+		--max-steps=6 --invariants=safety
+	PATH="$(JAVA_PATH_PREFIX)$$PATH" $(QUINT) verify specs/flush_ordering.qnt \
+		--max-steps=6 --invariants=safety
+	PATH="$(JAVA_PATH_PREFIX)$$PATH" $(QUINT) verify specs/dirty_page_read.qnt \
+		--max-steps=6 --invariants=safety
+	PATH="$(JAVA_PATH_PREFIX)$$PATH" $(QUINT) verify specs/mem_cache_epoch.qnt \
 		--max-steps=6 --invariants=safety
 
 .PHONY: specs-rust
