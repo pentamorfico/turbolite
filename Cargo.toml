@@ -31,7 +31,8 @@ parallel = []
 cli-s3 = ["dep:hadb-storage-s3"]
 # HTTPS storage backend: read SQLite page groups from a plain HTTPS endpoint
 # using HTTP Range requests. Adds `HttpsStorage` + `TurboliteVfs::new_https`.
-https = ["dep:reqwest"]
+# Uses `ureq` (already a direct dependency) for HTTP — no new deps required.
+https = []
 # Include HTTPS backend in the turbolite CLI binary.
 cli-https = ["https"]
 # Benchmark binaries still reference the pre-Anvil-g API surface
@@ -88,10 +89,6 @@ libc = "0.2"
 # Concrete storage backend for binaries that talk to S3 (CLI, benchmarks).
 # Library code never references this crate.
 hadb-storage-s3 = { version = "0.4.1", optional = true }
-
-# HTTPS storage backend — async reqwest HTTP client.
-# Enabled by the `https` feature; the library does not depend on this directly.
-reqwest = { version = "0.12", features = ["json"], optional = true }
 
 # CLI dependencies
 clap = { version = "4", features = ["derive", "env"] }
