@@ -160,7 +160,7 @@ import (
 )
 
 func main() {
-    db, err := turbolite.Open("/tmp/erda_demo.db", &turbolite.Options{
+    db, err := turbolite.Open("/tmp/mydb.db", &turbolite.Options{
         Mode:    "https",
         BaseURL: "https://example.com/turbolite/mydb",
     })
