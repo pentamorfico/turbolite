@@ -312,12 +312,17 @@ func Open(path string, opts *Options) (*sql.DB, error) {
 			if bearerToken != "" {
 				bearerArg = bearerToken
 			}
-			_, err := bootstrapDB.Exec(
+			var rc int
+			if err := bootstrapDB.QueryRow(
 				"SELECT turbolite_register_https_vfs(?, ?, ?, ?)",
-				vfsName, absPath, baseURL, bearerArg)
-			if err != nil {
+				vfsName, absPath, baseURL, bearerArg).Scan(&rc); err != nil {
 				httpsRegistryMu.Unlock()
 				return nil, fmt.Errorf("turbolite: register HTTPS VFS %q: %w", vfsName, err)
+			}
+			if rc != 0 {
+				httpsRegistryMu.Unlock()
+				return nil, fmt.Errorf("turbolite: register HTTPS VFS %q failed (rc=%d); "+
+					"check base_url and network connectivity", vfsName, rc)
 			}
 			httpsVFSByKey[key] = vfsName
 		}
