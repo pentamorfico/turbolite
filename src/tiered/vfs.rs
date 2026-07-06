@@ -218,6 +218,43 @@ impl TurboliteVfs {
         Self::assemble(config, backend, runtime, None, false)
     }
 
+    /// HTTPS mode. Reads page groups from a plain HTTPS endpoint using HTTP
+    /// Range requests.
+    ///
+    /// `base_url` is the root URL of the turbolite database, e.g.
+    /// `https://cdn.example.com/mydb`. The manifest is expected at
+    /// `{base_url}/manifest.msgpack` and page groups at `{base_url}/p/d/…`.
+    ///
+    /// This is a **read-only** mode: checkpoints and writes will fail. Set
+    /// `config.read_only = true` to enforce this at the SQLite layer.
+    ///
+    /// A local `config.cache_dir` is still needed to store the sub-chunk
+    /// cache and sidecar metadata.
+    ///
+    /// Requires the `https` feature.
+    #[cfg(feature = "https")]
+    pub fn new_https(base_url: impl Into<String>, mut config: TurboliteConfig) -> io::Result<Self> {
+        use super::https_storage::HttpsStorage;
+
+        let owned = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .map_err(|e| io::Error::other(format!("build tokio rt: {e}")))?;
+        let runtime = owned.handle().clone();
+        config.apply_legacy_flat_fields();
+        config.read_only = true;
+        fs::create_dir_all(&config.cache_dir)?;
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            HttpsStorage::new(base_url)
+                .map_err(|e| io::Error::other(format!("create HTTPS backend: {e}")))?,
+        );
+        #[cfg(feature = "bundled-sqlite")]
+        crate::install_hook::ensure_registered();
+        Self::assemble(config, storage, runtime, Some(owned), false)
+    }
+
     /// Private assembly path shared by [`Self::new_local`] and
     /// [`Self::with_backend`]. `owned_runtime` is Some only when the caller
     /// handed us a runtime to keep alive.

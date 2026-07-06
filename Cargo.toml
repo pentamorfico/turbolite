@@ -29,6 +29,12 @@ parallel = []
 # hadb-storage-s3 through this feature. The library itself never depends
 # on a concrete backend; it only knows hadb-storage (the trait).
 cli-s3 = ["dep:hadb-storage-s3"]
+# HTTPS storage backend: read SQLite page groups from a plain HTTPS endpoint
+# using HTTP Range requests. Adds `HttpsStorage` + `TurboliteVfs::new_https`.
+# Uses `ureq` (already a direct dependency) for HTTP — no new deps required.
+https = []
+# Include HTTPS backend in the turbolite CLI binary.
+cli-https = ["https"]
 # Benchmark binaries still reference the pre-Anvil-g API surface
 # (storage_backend, s3_counters, destroy_s3). Gated separately so
 # `cli-s3` alone doesn't pull them into `cargo build` / `cargo test`.
