@@ -120,9 +120,9 @@ db, err := turbolite.Open("/data/app.db", &turbolite.Options{
 
 | Variable | Description |
 |---|---|
-| `TURBOLITE_EXT_PATH` | **Required** — full path to `libturbolite_ffi.so`/`.dylib` |
+| `TURBOLITE_EXT_PATH` | **Required** — full path to `turbolite.so`/`turbolite.dylib` (see [Build the extension](#build-the-extension)) |
 | `TURBOLITE_BASE_URL` | Fallback for `BaseURL` (HTTPS mode) |
-| `TURBOLITE_BEARER_TOKEN` | Fallback for `BearerToken` (HTTPS mode) |
+| `TURBOLITE_BEARER_TOKEN` | Bearer token fallback for `BearerToken` (HTTPS mode) |
 | `TURBOLITE_BUCKET` | S3 bucket (S3 mode) |
 | `TURBOLITE_ENDPOINT_URL` | Custom S3 endpoint |
 | `TURBOLITE_REGION` | AWS region |

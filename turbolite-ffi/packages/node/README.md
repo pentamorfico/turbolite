@@ -150,7 +150,7 @@ Open a database. Returns a standard `better-sqlite3.Database`.
 | `readOnly` | `boolean` | `false` | Open in read-only mode. |
 | `pageCache` | `string` | `'64MB'` | In-memory page cache size. Set to `'0'` to disable. |
 | `baseUrl` | `string` | -- | Root URL of the turbolite object tree (required for `mode='https'`). |
-| `bearerToken` | `string` | -- | ****** for authenticated HTTPS endpoints (`mode='https'`). |
+| `bearerToken` | `string` | -- | Bearer token for authenticated HTTPS endpoints (`mode='https'`). |
 
 ### `turbolite.load(db)`
 
@@ -207,4 +207,4 @@ npm test
 | `TURBOLITE_MEM_CACHE_BUDGET` | Page cache size (default `64MB`) |
 | `TURBOLITE_COMPRESSION_LEVEL` | Zstd level 1-22 (default `3`) |
 | `TURBOLITE_BASE_URL` | Root HTTPS URL (HTTPS mode, fallback for `baseUrl`) |
-| `TURBOLITE_BEARER_TOKEN` | ****** for authenticated HTTPS endpoints (HTTPS mode) |
+| `TURBOLITE_BEARER_TOKEN` | Bearer token for authenticated HTTPS endpoints (HTTPS mode) |

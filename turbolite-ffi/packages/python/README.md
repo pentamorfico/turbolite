@@ -87,7 +87,7 @@ conn = turbolite.connect("/data/app.db", mode="s3",
 | `path` | `str` | required | Local path for the page image / cache file |
 | `mode` | `str` | `"local"` | `"local"`, `"s3"`, or `"https"` |
 | `base_url` | `str` | — | Root URL of the turbolite object tree (required for `mode="https"`) |
-| `bearer_token` | `str` | — | ****** for authenticated HTTPS endpoints |
+| `bearer_token` | `str` | — | Bearer token for authenticated HTTPS endpoints |
 | `bucket` | `str` | — | S3 bucket (required for `mode="s3"`) |
 | `endpoint` | `str` | AWS | Custom S3 endpoint URL |
 | `prefix` | `str` | derived | S3 key prefix |
