@@ -57,6 +57,11 @@ enum Commands {
         #[arg(long, env = "AWS_REGION")]
         region: Option<String>,
 
+        /// Base HTTPS URL of the turbolite database (e.g. https://cdn.example.com/mydb).
+        /// When set, reads page groups via HTTP Range requests. Mutually exclusive with --bucket.
+        #[arg(long, env = "TURBOLITE_HTTPS_URL", conflicts_with = "bucket")]
+        url: Option<String>,
+
         /// Local cache directory
         #[arg(long, default_value = "/tmp/turbolite-cache")]
         cache_dir: PathBuf,
@@ -83,6 +88,11 @@ enum Commands {
         /// AWS region (or set AWS_REGION)
         #[arg(long, env = "AWS_REGION")]
         region: Option<String>,
+
+        /// Base HTTPS URL of the turbolite database (e.g. https://cdn.example.com/mydb).
+        /// When set, reads page groups via HTTP Range requests. Mutually exclusive with --bucket.
+        #[arg(long, env = "TURBOLITE_HTTPS_URL", conflicts_with = "bucket")]
+        url: Option<String>,
 
         /// Local cache directory
         #[arg(long, default_value = "/tmp/turbolite-cache")]
@@ -149,6 +159,11 @@ enum Commands {
         /// AWS region (or set AWS_REGION)
         #[arg(long, env = "AWS_REGION")]
         region: Option<String>,
+
+        /// Base HTTPS URL of the turbolite database (e.g. https://cdn.example.com/mydb).
+        /// When set, reads page groups via HTTP Range requests. Mutually exclusive with --bucket.
+        #[arg(long, env = "TURBOLITE_HTTPS_URL", conflicts_with = "bucket")]
+        url: Option<String>,
 
         /// Local cache directory
         #[arg(long, default_value = "/tmp/turbolite-cache")]
@@ -221,9 +236,10 @@ type RuntimeGuard = Option<tokio::runtime::Runtime>;
 
 /// Build a TurboliteConfig + concrete backend + runtime guard from CLI args.
 ///
-/// When `bucket` is `None`, returns a local-only VFS (no runtime needed).
+/// When `bucket` is `None` and `url` is `None`, returns a local-only VFS.
 /// When `bucket` is `Some`, builds an `S3Storage` rooted at that bucket
 /// and returns an owned tokio runtime that outlives the returned VFS.
+/// When `url` is `Some`, builds an `HttpsStorage` (read-only).
 fn build_vfs(
     cache_dir: PathBuf,
     bucket: Option<String>,
@@ -231,6 +247,8 @@ fn build_vfs(
     endpoint: Option<String>,
     _region: Option<String>,
     read_only: bool,
+    #[cfg(feature = "https")] url: Option<String>,
+    #[cfg(not(feature = "https"))] _url: Option<String>,
 ) -> Result<(turbolite::tiered::TurboliteVfs, RuntimeGuard)> {
     use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 
@@ -239,6 +257,15 @@ fn build_vfs(
         read_only,
         ..Default::default()
     };
+
+    // HTTPS mode: read page groups from a plain HTTPS endpoint.
+    #[cfg(feature = "https")]
+    if let Some(base_url) = url {
+        let vfs = TurboliteVfs::new_https(base_url, config)
+            .context("failed to create HTTPS-backed VFS")?;
+        return Ok((vfs, None));
+    }
+
     match bucket {
         None => Ok((
             TurboliteVfs::new_local(config).context("failed to create local VFS")?,
@@ -305,9 +332,10 @@ fn cmd_info(
     prefix: Option<String>,
     endpoint: Option<String>,
     region: Option<String>,
+    url: Option<String>,
     cache_dir: PathBuf,
 ) -> Result<()> {
-    let (vfs, _runtime) = build_vfs(cache_dir, bucket, prefix, endpoint, region, true)?;
+    let (vfs, _runtime) = build_vfs(cache_dir, bucket, prefix, endpoint, region, true, url)?;
     let vfs_name = format!("turbolite-info-{}", std::process::id());
     let shared = turbolite::tiered::SharedTurboliteVfs::new(vfs);
     turbolite::tiered::register_shared(&vfs_name, shared.clone())
@@ -528,10 +556,11 @@ fn cmd_shell(
     prefix: Option<String>,
     endpoint: Option<String>,
     region: Option<String>,
+    url: Option<String>,
     cache_dir: PathBuf,
     read_only: bool,
 ) -> Result<()> {
-    let (vfs, _runtime) = build_vfs(cache_dir, bucket, prefix, endpoint, region, read_only)?;
+    let (vfs, _runtime) = build_vfs(cache_dir, bucket, prefix, endpoint, region, read_only, url)?;
     let vfs_name = format!("turbolite-shell-{}", std::process::id());
     let conn = open_connection(&db, vfs, &vfs_name)?;
 
@@ -796,7 +825,8 @@ fn cmd_validate(
     region: Option<String>,
     cache_dir: PathBuf,
 ) -> Result<()> {
-    let (vfs, _runtime) = build_vfs(cache_dir, Some(bucket), prefix, endpoint, region, true)?;
+    let (vfs, _runtime) =
+        build_vfs(cache_dir, Some(bucket), prefix, endpoint, region, true, None)?;
     let vfs_name = format!("turbolite-validate-{}", std::process::id());
     let shared = turbolite::tiered::SharedTurboliteVfs::new(vfs);
     turbolite::tiered::register_shared(&vfs_name, shared.clone())
@@ -883,9 +913,10 @@ fn cmd_export(
     prefix: Option<String>,
     endpoint: Option<String>,
     region: Option<String>,
+    url: Option<String>,
     cache_dir: PathBuf,
 ) -> Result<()> {
-    let (vfs, _runtime) = build_vfs(cache_dir, bucket, prefix, endpoint, region, true)?;
+    let (vfs, _runtime) = build_vfs(cache_dir, bucket, prefix, endpoint, region, true, url)?;
     let vfs_name = format!("turbolite-export-{}", std::process::id());
     let (shared, _conn) = open_shared(&db, vfs, &vfs_name)?;
 
@@ -1006,9 +1037,10 @@ fn main() -> Result<()> {
             prefix,
             endpoint,
             region,
+            url,
             cache_dir,
         } => {
-            cmd_info(db, bucket, prefix, endpoint, region, cache_dir)?;
+            cmd_info(db, bucket, prefix, endpoint, region, url, cache_dir)?;
         }
         Commands::Shell {
             db,
@@ -1016,10 +1048,11 @@ fn main() -> Result<()> {
             prefix,
             endpoint,
             region,
+            url,
             cache_dir,
             read_only,
         } => {
-            cmd_shell(db, bucket, prefix, endpoint, region, cache_dir, read_only)?;
+            cmd_shell(db, bucket, prefix, endpoint, region, url, cache_dir, read_only)?;
         }
         Commands::Download {
             db,
@@ -1049,9 +1082,10 @@ fn main() -> Result<()> {
             prefix,
             endpoint,
             region,
+            url,
             cache_dir,
         } => {
-            cmd_export(db, output, bucket, prefix, endpoint, region, cache_dir)?;
+            cmd_export(db, output, bucket, prefix, endpoint, region, url, cache_dir)?;
         }
         Commands::Import {
             input,

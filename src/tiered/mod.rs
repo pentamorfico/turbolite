@@ -79,6 +79,8 @@ mod replay;
 mod rotation;
 #[doc(hidden)]
 pub mod sashimono;
+#[cfg(feature = "https")]
+pub mod https_storage;
 pub mod settings;
 #[cfg(feature = "wal")]
 mod snapshot_source;
@@ -107,6 +109,8 @@ pub use manifest::{FrameEntry, Manifest, ReplayCursor, SubframeOverride};
 pub use replay::{FinalizeReport, ReplayHandle};
 pub use vfs::TurboliteVfs;
 pub use wire::{base_anchor_checksum, PayloadVersionError};
+#[cfg(feature = "https")]
+pub use https_storage::{HttpsStorage, HttpsStorageBuilder};
 // SharedTurboliteVfs and register_shared are exported from mod.rs directly (defined below)
 pub use query_plan::{
     attach_integer_constraint_hints, check_and_clear_end_query, parse_eqp_output,

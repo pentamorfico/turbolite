@@ -3922,6 +3922,7 @@ dependencies = [
  "proptest-derive",
  "rand 0.8.6",
  "rayon",
+ "reqwest",
  "rmp-serde",
  "rusqlite",
  "rustyline",
