@@ -109,7 +109,7 @@ const { connect } = require('turbolite');
 
 const db = connect('/tmp/mydb.db', {
   mode: 'https',
-  baseUrl: 'https://sid.erda.dk/share_redirect/GMqhSrgpvx/emapper_turbolite_https_1m',
+  baseUrl: 'https://example.com/turbolite/mydb',
 });
 
 const count = db.prepare('SELECT COUNT(*) FROM sqlite_master').pluck().get();

@@ -50,7 +50,7 @@ Query a turbolite database published as static files on any HTTPS server. The co
 conn = turbolite.connect(
     "/tmp/mydb.db",
     mode="https",
-    base_url="https://sid.erda.dk/share_redirect/GMqhSrgpvx/emapper_turbolite_https_1m",
+    base_url="https://example.com/turbolite/mydb",
 )
 count = conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()[0]
 print(count)

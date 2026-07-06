@@ -84,7 +84,7 @@ fmt.Println(v)  // hello
 ```go
 db, err := turbolite.Open("/tmp/mydb.db", &turbolite.Options{
     Mode:    "https",
-    BaseURL: "https://sid.erda.dk/share_redirect/GMqhSrgpvx/emapper_turbolite_https_1m",
+    BaseURL: "https://example.com/turbolite/mydb",
 })
 if err != nil {
     log.Fatal(err)
@@ -162,7 +162,7 @@ import (
 func main() {
     db, err := turbolite.Open("/tmp/erda_demo.db", &turbolite.Options{
         Mode:    "https",
-        BaseURL: "https://sid.erda.dk/share_redirect/GMqhSrgpvx/emapper_turbolite_https_1m",
+        BaseURL: "https://example.com/turbolite/mydb",
     })
     if err != nil {
         log.Fatal(err)
