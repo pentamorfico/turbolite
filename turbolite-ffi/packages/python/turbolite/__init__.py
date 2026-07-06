@@ -1,5 +1,5 @@
 """
-turbolite -- SQLite with compressed page groups and optional S3 cloud storage for Python.
+turbolite -- SQLite with compressed page groups and optional S3/HTTPS cloud storage for Python.
 
 Local mode (default), file-first::
 
@@ -14,6 +14,16 @@ S3 cloud mode::
     conn = turbolite.connect("/data/app.db", mode="s3",
         bucket="my-bucket",
         endpoint="https://t3.storage.dev")
+
+HTTPS read-only mode::
+
+    conn = turbolite.connect("/tmp/mydb.db", mode="https",
+        base_url="https://cdn.example.com/mydb")
+
+    # With bearer token for authenticated endpoints:
+    conn = turbolite.connect("/tmp/mydb.db", mode="https",
+        base_url="https://cdn.example.com/mydb",
+        bearer_token="tok123")
 
 Note: ``app.db`` is turbolite's compressed page image. It is not promised
 to be opened directly by stock ``sqlite3``. To produce a stock SQLite
@@ -39,6 +49,7 @@ __version__ = "0.4.1"
 # pinned to one database file.
 _vfs_counter = itertools.count()
 _s3_vfs_by_fingerprint: dict[tuple[object, ...], str] = {}
+_https_vfs_by_fingerprint: dict[tuple[object, ...], str] = {}
 
 
 def _find_ext() -> str:
@@ -163,6 +174,8 @@ def connect(
     prefetch_threads: int | None = None,
     read_only: bool = False,
     page_cache: str = "64MB",
+    base_url: str | None = None,
+    bearer_token: str | None = None,
 ) -> sqlite3.Connection:
     """
     Open a turbolite database, file-first.
@@ -173,7 +186,8 @@ def connect(
 
     Args:
         path: Path to the database file. May be relative or absolute.
-        mode: "local" for local VFS, "s3" for S3 cloud VFS.
+        mode: "local" for local VFS, "s3" for S3 cloud VFS, "https" for
+            read-only HTTPS VFS.
         bucket: S3 bucket (required for mode="s3", or set TURBOLITE_BUCKET).
         prefix: S3 key prefix. Defaults to a stable prefix derived from the
             database path, so distinct paths do not overlap in one bucket.
@@ -186,16 +200,21 @@ def connect(
         read_only: Open in read-only mode.
         page_cache: In-memory page cache size (default "64MB"). turbolite manages
             its own manifest-aware page cache. Set to "0" to disable.
+        base_url: Root URL of the turbolite object tree (required for
+            mode="https"). Example: "https://cdn.example.com/mydb".
+        bearer_token: Optional bearer token for authenticated HTTPS endpoints
+            (mode="https" only).
 
     Returns:
         An open sqlite3.Connection.
 
     Raises:
-        ValueError: If mode="s3" but no bucket is configured.
-        RuntimeError: If the S3 VFS fails to initialize.
+        ValueError: If mode="s3" but no bucket is configured, or if
+            mode="https" but no base_url is provided.
+        RuntimeError: If VFS initialization fails.
     """
-    if mode not in ("local", "s3"):
-        raise ValueError(f"mode must be 'local' or 's3', got {mode!r}")
+    if mode not in ("local", "s3", "https"):
+        raise ValueError(f"mode must be 'local', 's3', or 'https', got {mode!r}")
 
     abs_path = os.path.abspath(path)
     parent = os.path.dirname(abs_path)
@@ -215,14 +234,21 @@ def connect(
         if read_only:
             os.environ["TURBOLITE_READ_ONLY"] = "true"
 
+    if mode == "https":
+        effective_base_url = base_url or os.environ.get("TURBOLITE_BASE_URL")
+        if not effective_base_url:
+            raise ValueError(
+                "mode='https' requires a base_url. Pass base_url= or set TURBOLITE_BASE_URL."
+            )
+
     if compression_level is not None:
         os.environ["TURBOLITE_COMPRESSION_LEVEL"] = str(compression_level)
     if prefetch_threads is not None:
         os.environ["TURBOLITE_PREFETCH_THREADS"] = str(prefetch_threads)
     os.environ["TURBOLITE_MEM_CACHE_BUDGET"] = page_cache
 
-    # Load the extension once. S3 mode no longer depends on a fixed
-    # process-global VFS registered at extension load time; each S3 connect
+    # Load the extension once. S3/HTTPS modes do not depend on a fixed
+    # process-global VFS registered at extension load time; each connect
     # registers a per-volume VFS below.
     boot = _ensure_bootstrap()
 
@@ -239,6 +265,23 @@ def connect(
             raise RuntimeError(
                 f"turbolite: failed to register file-first VFS '{vfs}' for {abs_path}"
             )
+    elif mode == "https":
+        effective_base_url = base_url or os.environ.get("TURBOLITE_BASE_URL") or ""
+        effective_bearer_token = bearer_token or os.environ.get("TURBOLITE_BEARER_TOKEN")
+        fingerprint = (abs_path, effective_base_url, effective_bearer_token or "")
+        vfs = _https_vfs_by_fingerprint.get(fingerprint)
+        if vfs is None:
+            vfs = f"turbolite-https-{next(_vfs_counter)}"
+            rc = boot.execute(
+                "SELECT turbolite_register_https_vfs(?, ?, ?, ?)",
+                (vfs, abs_path, effective_base_url, effective_bearer_token),
+            ).fetchone()[0]
+            if rc != 0:
+                raise RuntimeError(
+                    f"turbolite: failed to register HTTPS VFS '{vfs}' "
+                    f"for {abs_path} at {effective_base_url}"
+                )
+            _https_vfs_by_fingerprint[fingerprint] = vfs
     else:
         effective_bucket = bucket or os.environ.get("TURBOLITE_BUCKET")
         if not effective_bucket:

@@ -653,8 +653,7 @@ int turbolite_c_sqlite3_turbolite_init(
         return rc;
     }
 
-
-     * SQLITE_TRACE_STMT: fires at start of sqlite3_step(), runs EQP, pushes
+    /* SQLITE_TRACE_STMT: fires at start of sqlite3_step(), runs EQP, pushes
      * planned B-tree accesses to the global queue (VFS drains on first read).
      * SQLITE_TRACE_PROFILE: fires when statement finishes, signals end-of-query
      * so VFS can run eviction on next read.

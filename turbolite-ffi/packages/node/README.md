@@ -2,13 +2,35 @@
 
 SQLite for Node.js with compressed page groups and optional S3 cloud storage. Returns standard **better-sqlite3** connections with full API: prepared statements, param binding, transactions, user-defined functions, aggregates, and more.
 
-## Install
+## Install from the fork (builds native extension from source)
+
+Requires Rust/Cargo ≥ 1.75 and a C compiler. `npm install turbolite` (npm registry) will not work for this fork. Instead, clone and install locally:
 
 ```bash
-npm install turbolite
+git clone https://github.com/pentamorfico/turbolite.git
+cd turbolite/turbolite-ffi/packages/node
+
+# 1. Build the native loadable extension (features: loadable-extension,cli-s3,https,zstd)
+npm run build-ext
+
+# 2. Install dependencies (patches better-sqlite3 for SQLITE_USE_URI=1 and rebuilds it)
+npm install
+
+# 3. Build TypeScript
+npm run build
 ```
 
-The postinstall script patches better-sqlite3 to enable URI filename support (`SQLITE_USE_URI=1`) and rebuilds from source. This is required for VFS selection via URI.
+Then in your project, use a `file:` path or `npm pack` + install the tarball:
+
+```bash
+# From turbolite-ffi/packages/node:
+npm pack
+# Produces turbolite-0.5.0.tgz — install in your project:
+npm install /path/to/turbolite-0.5.0.tgz
+```
+
+> **Why not `npm install` from a Git URL?**
+> npm Git installs run in a sandbox without the parent `turbolite-ffi/` Cargo workspace, so `build-ext` cannot find the Rust sources. Clone the repo and install locally (as above) or from a packed tarball.
 
 ## Usage
 
@@ -75,19 +97,30 @@ const db = turbolite.connect('my.db', {
 
 ### HTTPS read-only mode
 
-Query a turbolite database published as static files on any HTTPS server (CDN, S3 static website, etc.). The connection is read-only.
+Query a turbolite database published as static files on any HTTPS server (CDN, S3 static website, etc.). The connection is **read-only**.
+
+- `baseUrl` must point to the **root of the turbolite object tree** — not a plain `.db` file.
+- The remote must expose `manifest.msgpack` and a `p/` directory of compressed page-group files.
+- A local sidecar directory (`<path>-turbolite/`) caches fetched pages next to the local file path.
+- **HTTPS is read-only.** Any write operation will fail.
 
 ```js
-const db = turbolite.connect('/tmp/mydb.db', {
+const { connect } = require('turbolite');
+
+const db = connect('/tmp/mydb.db', {
   mode: 'https',
-  baseUrl: 'https://cdn.example.com/mydb',
+  baseUrl: 'https://sid.erda.dk/share_redirect/GMqhSrgpvx/emapper_turbolite_https_1m',
 });
+
+const count = db.prepare('SELECT COUNT(*) FROM sqlite_master').pluck().get();
+console.log(count);
+db.close();
 ```
 
 With a bearer token for authenticated endpoints:
 
 ```js
-const db = turbolite.connect('/tmp/mydb.db', {
+const db = connect('/tmp/mydb.db', {
   mode: 'https',
   baseUrl: 'https://cdn.example.com/mydb',
   bearerToken: 'tok123',
