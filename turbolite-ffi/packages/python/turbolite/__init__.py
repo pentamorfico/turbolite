@@ -235,7 +235,7 @@ def connect(
             os.environ["TURBOLITE_READ_ONLY"] = "true"
 
     if mode == "https":
-        effective_base_url = base_url or os.environ.get("TURBOLITE_BASE_URL")
+        effective_base_url = base_url or os.environ.get("TURBOLITE_BASE_URL") or ""
         if not effective_base_url:
             raise ValueError(
                 "mode='https' requires a base_url. Pass base_url= or set TURBOLITE_BASE_URL."
@@ -266,7 +266,6 @@ def connect(
                 f"turbolite: failed to register file-first VFS '{vfs}' for {abs_path}"
             )
     elif mode == "https":
-        effective_base_url = base_url or os.environ.get("TURBOLITE_BASE_URL") or ""
         effective_bearer_token = bearer_token or os.environ.get("TURBOLITE_BEARER_TOKEN")
         fingerprint = (abs_path, effective_base_url, effective_bearer_token or "")
         vfs = _https_vfs_by_fingerprint.get(fingerprint)
