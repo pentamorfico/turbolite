@@ -91,7 +91,7 @@ impl Inner {
                             attempt
                         ));
                     }
-                    std::thread::sleep(Duration::from_millis(RETRY_BASE_MS * (1 << attempt)));
+                    std::thread::sleep(Duration::from_millis(RETRY_BASE_MS * (1 << (attempt - 1))));
                 }
                 Err(ureq::Error::Transport(e)) => {
                     attempt += 1;
@@ -103,7 +103,7 @@ impl Inner {
                             e
                         ));
                     }
-                    std::thread::sleep(Duration::from_millis(RETRY_BASE_MS * (1 << attempt)));
+                    std::thread::sleep(Duration::from_millis(RETRY_BASE_MS * (1 << (attempt - 1))));
                 }
             }
         }
@@ -144,7 +144,7 @@ impl Inner {
                             attempt
                         ));
                     }
-                    std::thread::sleep(Duration::from_millis(RETRY_BASE_MS * (1 << attempt)));
+                    std::thread::sleep(Duration::from_millis(RETRY_BASE_MS * (1 << (attempt - 1))));
                 }
                 Err(ureq::Error::Transport(e)) => {
                     attempt += 1;
@@ -156,7 +156,7 @@ impl Inner {
                             e
                         ));
                     }
-                    std::thread::sleep(Duration::from_millis(RETRY_BASE_MS * (1 << attempt)));
+                    std::thread::sleep(Duration::from_millis(RETRY_BASE_MS * (1 << (attempt - 1))));
                 }
             }
         }
@@ -359,10 +359,11 @@ mod tests {
 
     #[test]
     fn builder_sets_timeout() {
-        let s = HttpsStorage::builder("https://example.com/mydb")
+        // Verify the builder compiles and builds successfully with a custom
+        // timeout; the ureq Agent doesn't expose its timeout for inspection.
+        HttpsStorage::builder("https://example.com/mydb")
             .timeout_secs(60)
             .build()
             .unwrap();
-        let _ = s;
     }
 }
