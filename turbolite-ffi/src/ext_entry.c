@@ -46,6 +46,16 @@ extern int turbolite_ext_register_s3_file_first_vfs(
     const char *region
 );
 
+/* Rust function -- registers a read-only HTTPS VFS keyed to a base URL.
+ * bearer_token may be NULL for unauthenticated endpoints.
+ * Defined in src/ext.rs. */
+extern int turbolite_ext_register_https_vfs(
+    const char *name,
+    const char *db_path,
+    const char *base_url,
+    const char *bearer_token
+);
+
 /* Rust function -- runs EQP on SQL and pushes plan to global queue.
  * Defined in src/tiered/query_plan.rs. */
 extern void turbolite_trace_push_plan(sqlite3 *db, const char *sql);
@@ -185,6 +195,46 @@ static void turbolite_register_s3_file_first_vfs_func(
     }
     int rc = turbolite_ext_register_s3_file_first_vfs(
         name, db_path, bucket, prefix, endpoint, region);
+    sqlite3_result_int(ctx, rc);
+}
+
+/*
+ * turbolite_register_https_vfs(
+ *   name TEXT, db_path TEXT, base_url TEXT, bearer_token TEXT
+ * )
+ *
+ * Register a read-only HTTPS VFS. `base_url` is the root of the turbolite
+ * object tree on the HTTPS server (e.g. 'https://cdn.example.com/mydb').
+ * `bearer_token` may be NULL for unauthenticated endpoints.
+ *
+ * Example:
+ *   SELECT turbolite_register_https_vfs(
+ *       'mydb', '/tmp/mydb.db',
+ *       'https://cdn.example.com/mydb', NULL
+ *   );
+ *   -- Then open: sqlite3_open_v2('/tmp/mydb.db', ..., 'mydb');
+ *
+ * Returns 0 on success, 1 on error.
+ */
+static void turbolite_register_https_vfs_func(
+    sqlite3_context *ctx,
+    int argc,
+    sqlite3_value **argv
+) {
+    (void)argc;
+    const char *name = (const char *)sqlite3_value_text(argv[0]);
+    const char *db_path = (const char *)sqlite3_value_text(argv[1]);
+    const char *base_url = (const char *)sqlite3_value_text(argv[2]);
+    /* argv[3] is bearer_token — may be NULL */
+    const char *bearer_token = (const char *)sqlite3_value_text(argv[3]);
+    if (!name || !db_path || !base_url) {
+        sqlite3_result_error(
+            ctx,
+            "turbolite_register_https_vfs: name, db_path, and base_url required",
+            -1);
+        return;
+    }
+    int rc = turbolite_ext_register_https_vfs(name, db_path, base_url, bearer_token);
     sqlite3_result_int(ctx, rc);
 }
 
@@ -590,7 +640,20 @@ int turbolite_c_sqlite3_turbolite_init(
         return rc;
     }
 
-    /* Install trace callback for frontrun prefetch + between-query eviction.
+    /* register turbolite_register_https_vfs(name, db_path, base_url, bearer_token)
+     * SQL function. Registers a read-only HTTPS VFS keyed to one base URL.
+     * bearer_token may be NULL for public endpoints. */
+    rc = sqlite3_create_function_v2(
+        db, "turbolite_register_https_vfs", 4,
+        SQLITE_UTF8, 0, turbolite_register_https_vfs_func, 0, 0, 0
+    );
+    if (rc != SQLITE_OK) {
+        *pzErrMsg = sqlite3_mprintf(
+            "turbolite: failed to register turbolite_register_https_vfs()");
+        return rc;
+    }
+
+
      * SQLITE_TRACE_STMT: fires at start of sqlite3_step(), runs EQP, pushes
      * planned B-tree accesses to the global queue (VFS drains on first read).
      * SQLITE_TRACE_PROFILE: fires when statement finishes, signals end-of-query

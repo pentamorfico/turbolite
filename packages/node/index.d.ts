@@ -5,7 +5,7 @@
 
 /** Options for opening a Database. */
 export interface DatabaseOptions {
-  /** Storage mode: "local" (default) or "s3". */
+  /** Storage mode: "local" (default), "s3", or "https". */
   mode?: string
   /** Zstd compression level 1-22 (local mode, default 3). Pass null for no compression. */
   compression?: number
@@ -15,20 +15,25 @@ export interface DatabaseOptions {
   endpoint?: string
   /** S3 key prefix (mode = "s3", default "turbolite"). */
   prefix?: string
-  /** Local cache directory (mode = "s3", defaults to db file's parent directory). */
+  /** Local cache directory (mode = "s3" or "https", defaults to db file's parent directory). */
   cacheDir?: string
   /** AWS region (mode = "s3"). */
   region?: string
+  /** Base URL of the turbolite object tree (required when mode = "https"). Example: "https://cdn.example.com/mydb". */
+  baseUrl?: string
+  /** ****** for authenticated HTTPS endpoints (mode = "https", optional). */
+  bearerToken?: string
 }
-/** A SQLite database connection with TurboliteVfs (local or S3 cloud storage). */
+/** A SQLite database connection with TurboliteVfs (local, S3, or HTTPS cloud storage). */
 export declare class Database {
   /**
    * Open a database.
    *
    * @param path - Path to the database file.
    * @param options - Options object. Omit for local compressed mode.
-   *   Local mode: `{ compression: 3 }` (zstd level 1-22; omit for no compression).
-   *   S3 mode:    `{ mode: "s3", bucket: "my-bucket", endpoint: "..." }`.
+   *   Local mode:  `{ compression: 3 }` (zstd level 1-22; omit for no compression).
+   *   S3 mode:     `{ mode: "s3", bucket: "my-bucket", endpoint: "..." }`.
+   *   HTTPS mode:  `{ mode: "https", baseUrl: "https://cdn.example.com/mydb" }` (read-only).
    */
   constructor(path: string, options?: DatabaseOptions | undefined | null)
   /** Execute SQL that returns no rows (DDL, INSERT, UPDATE, DELETE). */

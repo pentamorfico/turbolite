@@ -33,6 +33,10 @@ encryption = ["turbolite/encryption"]
 # Re-exposes the cloud-mode FFI (`turbolite_register_cloud` /
 # `turbolite_register_tiered`). Requires turbolite's cli-s3 backend.
 cli-s3 = ["turbolite/cli-s3", "dep:anyhow", "dep:async-trait", "dep:aws-config", "dep:aws-sdk-s3", "dep:hadb-storage-s3", "dep:hadb-storage", "dep:tokio"]
+# Exposes the HTTPS read-only VFS registration (`turbolite_register_https` /
+# `turbolite_ext_register_https_vfs`). Uses ureq which is already a transitive
+# dependency, so no new crates are added.
+https = ["turbolite/https", "dep:tokio"]
 
 [dependencies]
 turbolite = { path = "..", version = "0.5", default-features = false }

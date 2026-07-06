@@ -2,6 +2,7 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use rusqlite::{Connection, OpenFlags};
 use turbolite::tiered::{register as tiered_register, TurboliteConfig, TurboliteVfs, StorageBackend};
+use turbolite::tiered::HttpsStorage;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static VFS_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -9,7 +10,7 @@ static VFS_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Options for opening a Database.
 #[napi(object)]
 pub struct DatabaseOptions {
-    /// Storage mode: "local" (default) or "s3".
+    /// Storage mode: "local" (default), "s3", or "https".
     pub mode: Option<String>,
     /// Zstd compression level 1-22 (local mode, default 3). Pass null for no compression.
     pub compression: Option<i32>,
@@ -23,6 +24,11 @@ pub struct DatabaseOptions {
     pub cache_dir: Option<String>,
     /// AWS region (mode = "s3").
     pub region: Option<String>,
+    /// Base URL of the turbolite object tree (required when mode = "https").
+    /// Example: "https://cdn.example.com/mydb".
+    pub base_url: Option<String>,
+    /// ****** for authenticated HTTPS endpoints (mode = "https", optional).
+    pub bearer_token: Option<String>,
 }
 
 /// A SQLite database connection with TurboliteVfs (local or S3 cloud storage).
@@ -116,6 +122,61 @@ impl Database {
             ).map_err(|e| Error::from_reason(format!("set S3 pragmas: {e}")))?;
 
             conn
+        } else if mode == "https" {
+            let base_url = options
+                .as_ref()
+                .and_then(|o| o.base_url.clone())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| Error::from_reason("baseUrl is required for https mode"))?;
+            let bearer_token = options
+                .as_ref()
+                .and_then(|o| o.bearer_token.clone())
+                .filter(|s| !s.is_empty());
+            let cache_dir = options
+                .as_ref()
+                .and_then(|o| o.cache_dir.as_ref().map(|s| std::path::PathBuf::from(s)))
+                .unwrap_or_else(|| base_dir.clone());
+
+            let config = TurboliteConfig {
+                cache_dir,
+                ..Default::default()
+            };
+
+            let vfs = if let Some(token) = bearer_token {
+                let storage = HttpsStorage::builder(&base_url)
+                    .bearer_token(token)
+                    .build()
+                    .map_err(|e| Error::from_reason(format!("create HTTPS backend: {e}")))?;
+                // Use a shared process-global tokio runtime so its handle stays
+                // valid for the lifetime of the VFS.
+                static HTTPS_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> =
+                    std::sync::OnceLock::new();
+                let rt = HTTPS_RUNTIME.get_or_init(|| {
+                    tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(2)
+                        .enable_all()
+                        .build()
+                        .expect("turbolite HTTPS runtime")
+                });
+                TurboliteVfs::with_backend(
+                    config,
+                    std::sync::Arc::new(storage),
+                    rt.handle().clone(),
+                )
+                .map_err(|e| Error::from_reason(format!("create HTTPS VFS: {e}")))?
+            } else {
+                TurboliteVfs::new_https(base_url, config)
+                    .map_err(|e| Error::from_reason(format!("create HTTPS VFS: {e}")))?
+            };
+
+            tiered_register(&vfs_name, vfs)
+                .map_err(|e| Error::from_reason(format!("register HTTPS VFS: {e}")))?;
+
+            // HTTPS mode is read-only; open with read-only flags so SQLite
+            // does not attempt WAL/journal writes that would fail.
+            let ro_flags = OpenFlags::SQLITE_OPEN_READ_ONLY;
+            Connection::open_with_flags_and_vfs(&abs_path, ro_flags, &vfs_name)
+                .map_err(|e| Error::from_reason(format!("open: {e}")))?
         } else {
             let compression = options.as_ref().and_then(|o| o.compression).unwrap_or(3);
             let config = TurboliteConfig {
