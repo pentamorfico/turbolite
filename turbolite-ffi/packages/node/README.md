@@ -73,6 +73,27 @@ const db = turbolite.connect('my.db', {
 });
 ```
 
+### HTTPS read-only mode
+
+Query a turbolite database published as static files on any HTTPS server (CDN, S3 static website, etc.). The connection is read-only.
+
+```js
+const db = turbolite.connect('/tmp/mydb.db', {
+  mode: 'https',
+  baseUrl: 'https://cdn.example.com/mydb',
+});
+```
+
+With a bearer token for authenticated endpoints:
+
+```js
+const db = turbolite.connect('/tmp/mydb.db', {
+  mode: 'https',
+  baseUrl: 'https://cdn.example.com/mydb',
+  bearerToken: 'tok123',
+});
+```
+
 ## API
 
 ### `turbolite.connect(path, options?)`
@@ -86,7 +107,7 @@ Open a database. Returns a standard `better-sqlite3.Database`.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `mode` | `'local' \| 's3'` | `'local'` | Storage mode. |
+| `mode` | `'local' \| 's3' \| 'https'` | `'local'` | Storage mode. |
 | `bucket` | `string` | -- | S3 bucket name (required for `mode='s3'`). |
 | `endpoint` | `string` | AWS S3 | Custom S3 endpoint URL. |
 | `prefix` | `string` | `'turbolite'` | S3 key prefix. |
@@ -95,6 +116,8 @@ Open a database. Returns a standard `better-sqlite3.Database`.
 | `compressionLevel` | `number` | `3` | Zstd compression level 1-22. |
 | `readOnly` | `boolean` | `false` | Open in read-only mode. |
 | `pageCache` | `string` | `'64MB'` | In-memory page cache size. Set to `'0'` to disable. |
+| `baseUrl` | `string` | -- | Root URL of the turbolite object tree (required for `mode='https'`). |
+| `bearerToken` | `string` | -- | ****** for authenticated HTTPS endpoints (`mode='https'`). |
 
 ### `turbolite.load(db)`
 
@@ -150,3 +173,5 @@ npm test
 | `TURBOLITE_ENDPOINT_URL` | Custom S3 endpoint URL (S3 mode) |
 | `TURBOLITE_MEM_CACHE_BUDGET` | Page cache size (default `64MB`) |
 | `TURBOLITE_COMPRESSION_LEVEL` | Zstd level 1-22 (default `3`) |
+| `TURBOLITE_BASE_URL` | Root HTTPS URL (HTTPS mode, fallback for `baseUrl`) |
+| `TURBOLITE_BEARER_TOKEN` | ****** for authenticated HTTPS endpoints (HTTPS mode) |

@@ -990,7 +990,7 @@ fn required_cstr(ptr: *const std::os::raw::c_char) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-#[cfg(feature = "cli-s3")]
+#[cfg(any(feature = "cli-s3", feature = "https"))]
 fn optional_cstr(ptr: *const std::os::raw::c_char) -> Option<String> {
     if ptr.is_null() {
         return None;
@@ -1127,6 +1127,121 @@ fn register_tiered() -> Result<(), std::io::Error> {
         "TURBOLITE_BUCKET is set but this extension was built without the 'cloud' feature. \
          Rebuild with: make ext  (includes cloud by default)",
     ))
+}
+
+/// Register a read-only HTTPS VFS keyed to one logical database path.
+///
+/// Called from SQL via:
+///
+/// ```sql
+/// SELECT turbolite_register_https_vfs('mydb', '/tmp/mydb.db',
+///                                     'https://cdn.example.com/mydb', NULL);
+/// ```
+///
+/// `base_url` is the root of the turbolite object tree on the HTTPS server
+/// (e.g. `https://cdn.example.com/mydb`). The manifest is fetched from
+/// `<base_url>/manifest.msgpack` and page groups from `<base_url>/p/…`.
+///
+/// `bearer_token_ptr` may be NULL for unauthenticated endpoints; when
+/// provided it is sent as an `Authorization: ****** header.
+///
+/// Returns 0 on success, 1 on error.
+///
+/// # Safety
+/// `name_ptr`, `db_path_ptr`, and `base_url_ptr` must be valid,
+/// NUL-terminated C strings. `bearer_token_ptr` must be either NULL or a
+/// valid NUL-terminated C string.
+#[cfg(feature = "https")]
+#[no_mangle]
+pub unsafe extern "C" fn turbolite_ext_register_https_vfs(
+    name_ptr: *const std::os::raw::c_char,
+    db_path_ptr: *const std::os::raw::c_char,
+    base_url_ptr: *const std::os::raw::c_char,
+    bearer_token_ptr: *const std::os::raw::c_char,
+) -> std::os::raw::c_int {
+    use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
+
+    ext_guard(1, || {
+        let name = match required_cstr(name_ptr) {
+            Some(s) => s,
+            None => return 1,
+        };
+        let db_path = match required_cstr(db_path_ptr) {
+            Some(s) => std::path::PathBuf::from(s),
+            None => return 1,
+        };
+        let base_url = match required_cstr(base_url_ptr) {
+            Some(s) => s,
+            None => {
+                eprintln!("turbolite: base_url is required for HTTPS VFS '{name}'");
+                return 1;
+            }
+        };
+        let bearer_token = optional_cstr(bearer_token_ptr);
+
+        let config = TurboliteConfig::from_env().with_database_path(db_path);
+        let vfs = if let Some(token) = bearer_token {
+            // ****** requires the builder. Use a shared process-global
+            // tokio runtime (same pattern as the S3 registration path) so the
+            // handle stays valid for the lifetime of the VFS.
+            static HTTPS_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> =
+                std::sync::OnceLock::new();
+            let rt = HTTPS_RUNTIME.get_or_init(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .expect("turbolite HTTPS runtime")
+            });
+            let storage = match turbolite::tiered::HttpsStorage::builder(&base_url)
+                .bearer_token(token)
+                .build()
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!(
+                        "turbolite: failed to create HTTPS backend for VFS '{name}': {e}"
+                    );
+                    return 1;
+                }
+            };
+            TurboliteVfs::with_backend(
+                config,
+                std::sync::Arc::new(storage),
+                rt.handle().clone(),
+            )
+        } else {
+            TurboliteVfs::new_https(&base_url, config)
+        };
+
+        match vfs {
+            Ok(vfs) => match register_turbolite_vfs(&name, vfs) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("turbolite: failed to register HTTPS VFS '{name}': {e}");
+                    1
+                }
+            },
+            Err(e) => {
+                eprintln!("turbolite: failed to create HTTPS VFS '{name}': {e}");
+                1
+            }
+        }
+    })
+}
+
+/// # Safety
+/// See the `https` build of this function; this stub dereferences nothing.
+#[cfg(not(feature = "https"))]
+#[no_mangle]
+pub unsafe extern "C" fn turbolite_ext_register_https_vfs(
+    _name_ptr: *const std::os::raw::c_char,
+    _db_path_ptr: *const std::os::raw::c_char,
+    _base_url_ptr: *const std::os::raw::c_char,
+    _bearer_token_ptr: *const std::os::raw::c_char,
+) -> std::os::raw::c_int {
+    eprintln!("turbolite: HTTPS VFS registration requires the 'https' feature");
+    1
 }
 
 #[cfg(test)]

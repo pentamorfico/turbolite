@@ -23,6 +23,20 @@
 //	    Endpoint: "https://t3.storage.dev",
 //	})
 //
+// HTTPS read-only mode:
+//
+//	db, err := turbolite.Open("/tmp/mydb.db", &turbolite.Options{
+//	    Mode:    "https",
+//	    BaseURL: "https://cdn.example.com/mydb",
+//	})
+//
+//	// With a bearer token for authenticated endpoints:
+//	db, err := turbolite.Open("/tmp/mydb.db", &turbolite.Options{
+//	    Mode:        "https",
+//	    BaseURL:     "https://cdn.example.com/mydb",
+//	    BearerToken: "tok123",
+//	})
+//
 // Note: app.db is turbolite's compressed page image. It is not promised
 // to be opened directly by stock sqlite3. To get a stock SQLite file,
 // run `db.Exec("VACUUM INTO 'export.sqlite'")` while connected.
@@ -43,7 +57,7 @@ import (
 
 // Options for opening a turbolite database.
 type Options struct {
-	// Storage mode: "local" (default) or "s3".
+	// Storage mode: "local" (default), "s3", or "https".
 	Mode string
 	// S3 bucket name (required for mode "s3").
 	Bucket string
@@ -63,6 +77,11 @@ type Options struct {
 	PrefetchThreads int
 	// Open in read-only mode.
 	ReadOnly bool
+	// Root URL of the turbolite object tree (required for mode "https").
+	// Example: "https://cdn.example.com/mydb". Must not have a trailing slash.
+	BaseURL string
+	// ****** for authenticated HTTPS endpoints (mode "https", optional).
+	BearerToken string
 }
 
 var (
@@ -74,8 +93,11 @@ var (
 	bootstrapErr  error
 	bootstrapDB   *sql.DB
 
-	s3RegistryMu sync.Mutex
-	s3VFSByKey   = map[string]string{}
+	s3RegistryMu   sync.Mutex
+	s3VFSByKey     = map[string]string{}
+
+	httpsRegistryMu sync.Mutex
+	httpsVFSByKey   = map[string]string{}
 
 	extPathOnce sync.Once
 	extPath     string
@@ -85,6 +107,11 @@ var (
 func defaultS3VFSName(key string) string {
 	sum := sha256.Sum256([]byte(key))
 	return fmt.Sprintf("turbolite-s3-%x", sum[:8])
+}
+
+func defaultHTTPSVFSName(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return fmt.Sprintf("turbolite-https-%x", sum[:8])
 }
 
 func defaultS3Prefix(absPath string) string {
@@ -193,8 +220,8 @@ func Open(path string, opts *Options) (*sql.DB, error) {
 	if opts.Mode == "" {
 		opts.Mode = "local"
 	}
-	if opts.Mode != "local" && opts.Mode != "s3" {
-		return nil, fmt.Errorf("turbolite: mode must be 'local' or 's3', got %q", opts.Mode)
+	if opts.Mode != "local" && opts.Mode != "s3" && opts.Mode != "https" {
+		return nil, fmt.Errorf("turbolite: mode must be 'local', 's3', or 'https', got %q", opts.Mode)
 	}
 	if opts.PageCache == "" {
 		opts.PageCache = "64MB"
@@ -229,6 +256,15 @@ func Open(path string, opts *Options) (*sql.DB, error) {
 			os.Setenv("TURBOLITE_READ_ONLY", "true")
 		}
 	}
+	if opts.Mode == "https" {
+		baseURL := opts.BaseURL
+		if baseURL == "" {
+			baseURL = os.Getenv("TURBOLITE_BASE_URL")
+		}
+		if baseURL == "" {
+			return nil, fmt.Errorf("turbolite: mode='https' requires BaseURL or TURBOLITE_BASE_URL")
+		}
+	}
 	if opts.CompressionLevel > 0 {
 		os.Setenv("TURBOLITE_COMPRESSION_LEVEL", fmt.Sprintf("%d", opts.CompressionLevel))
 	}
@@ -258,6 +294,34 @@ func Open(path string, opts *Options) (*sql.DB, error) {
 		if err != nil {
 			return nil, fmt.Errorf("turbolite: register file-first VFS %q: %w", vfsName, err)
 		}
+	} else if opts.Mode == "https" {
+		baseURL := opts.BaseURL
+		if baseURL == "" {
+			baseURL = os.Getenv("TURBOLITE_BASE_URL")
+		}
+		bearerToken := opts.BearerToken
+		if bearerToken == "" {
+			bearerToken = os.Getenv("TURBOLITE_BEARER_TOKEN")
+		}
+		key := strings.Join([]string{absPath, baseURL, bearerToken}, "\x00")
+		httpsRegistryMu.Lock()
+		vfsName = httpsVFSByKey[key]
+		if vfsName == "" {
+			vfsName = defaultHTTPSVFSName(key)
+			var bearerArg interface{}
+			if bearerToken != "" {
+				bearerArg = bearerToken
+			}
+			_, err := bootstrapDB.Exec(
+				"SELECT turbolite_register_https_vfs(?, ?, ?, ?)",
+				vfsName, absPath, baseURL, bearerArg)
+			if err != nil {
+				httpsRegistryMu.Unlock()
+				return nil, fmt.Errorf("turbolite: register HTTPS VFS %q: %w", vfsName, err)
+			}
+			httpsVFSByKey[key] = vfsName
+		}
+		httpsRegistryMu.Unlock()
 	} else {
 		bucket := opts.Bucket
 		if bucket == "" {
@@ -325,7 +389,9 @@ func Open(path string, opts *Options) (*sql.DB, error) {
 
 	// Build DSN with VFS selection.
 	dsn := fmt.Sprintf("file:%s?vfs=%s", absPath, vfsName)
-	if opts.ReadOnly {
+	// HTTPS mode is inherently read-only; force ro flag so SQLite does not
+	// attempt WAL/journal writes that would fail against a remote endpoint.
+	if opts.ReadOnly || opts.Mode == "https" {
 		dsn += "&mode=ro"
 	}
 

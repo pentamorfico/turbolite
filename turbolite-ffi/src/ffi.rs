@@ -582,7 +582,105 @@ pub extern "C" fn turbolite_register_tiered(
     turbolite_register_cloud(name, bucket, prefix, cache_dir, endpoint_url, region)
 }
 
-// --- Utilities ---
+/// Register a read-only HTTPS VFS.
+///
+/// The VFS fetches manifests and page groups from a plain HTTPS server using
+/// HTTP Range requests. It is intentionally read-only: write operations
+/// return errors.
+///
+/// # Parameters
+/// - `name`: VFS name (e.g. `"turbolite-https"`). Must be unique per process.
+/// - `base_url`: Root URL of the turbolite object tree, e.g.
+///   `https://cdn.example.com/mydb`. Must **not** have a trailing slash.
+/// - `cache_dir`: Local directory for the turbolite page cache. Created if
+///   it does not exist. Pass `"."` to use the current working directory.
+/// - `bearer_token`: Optional bearer token for authenticated endpoints. Pass
+///   NULL for public/unauthenticated endpoints.
+///
+/// # Returns
+/// 0 on success, -1 on error. Call `turbolite_last_error()` for details.
+#[cfg(feature = "https")]
+#[no_mangle]
+pub extern "C" fn turbolite_register_https(
+    name: *const c_char,
+    base_url: *const c_char,
+    cache_dir: *const c_char,
+    bearer_token: *const c_char,
+) -> c_int {
+    ffi_guard(-1, || {
+        clear_last_error();
+        let name = match unsafe { cstr_to_str(&name, "name") } {
+            Ok(s) => s,
+            Err(code) => return code,
+        };
+        let base_url = match unsafe { cstr_to_str(&base_url, "base_url") } {
+            Ok(s) => s,
+            Err(code) => return code,
+        };
+        let cache_dir = match unsafe { cstr_to_str(&cache_dir, "cache_dir") } {
+            Ok(s) => s,
+            Err(code) => return code,
+        };
+        let bearer_token: Option<String> = if bearer_token.is_null() {
+            None
+        } else {
+            match unsafe { cstr_to_str(&bearer_token, "bearer_token") } {
+                Ok(s) => Some(s.to_string()),
+                Err(code) => return code,
+            }
+        };
+
+        let config = turbolite::tiered::TurboliteConfig {
+            cache_dir: std::path::PathBuf::from(cache_dir),
+            ..Default::default()
+        };
+
+        let vfs = if let Some(token) = bearer_token {
+            // ****** build storage via builder, use a shared runtime.
+            static HTTPS_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> =
+                std::sync::OnceLock::new();
+            let rt = HTTPS_RUNTIME.get_or_init(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .expect("turbolite HTTPS runtime")
+            });
+            let storage = match turbolite::tiered::HttpsStorage::builder(base_url)
+                .bearer_token(token)
+                .build()
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    set_last_error(&format!("create HTTPS backend: {e}"));
+                    return -1;
+                }
+            };
+            turbolite::tiered::TurboliteVfs::with_backend(
+                config,
+                std::sync::Arc::new(storage),
+                rt.handle().clone(),
+            )
+        } else {
+            turbolite::tiered::TurboliteVfs::new_https(base_url, config)
+        };
+
+        match vfs {
+            Ok(v) => match register_turbolite_vfs(name, v) {
+                Ok(()) => 0,
+                Err(e) => {
+                    set_last_error(&format!("register failed: {e}"));
+                    -1
+                }
+            },
+            Err(e) => {
+                set_last_error(&format!("https vfs creation failed: {e}"));
+                -1
+            }
+        }
+    })
+}
+
 
 /// Clear all VFS caches (shared file state, in-process locks).
 ///
