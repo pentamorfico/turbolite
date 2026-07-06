@@ -19,6 +19,20 @@
  *     endpoint: 'https://t3.storage.dev',
  *   });
  *
+ * HTTPS read-only mode:
+ *
+ *   const db = connect('/tmp/mydb.db', {
+ *     mode: 'https',
+ *     baseUrl: 'https://cdn.example.com/mydb',
+ *   });
+ *
+ *   // With a bearer token for authenticated endpoints:
+ *   const db = connect('/tmp/mydb.db', {
+ *     mode: 'https',
+ *     baseUrl: 'https://cdn.example.com/mydb',
+ *     bearerToken: 'tok123',
+ *   });
+ *
  * Note: app.db is turbolite's compressed page image. It is not promised
  * to be opened directly by stock sqlite3. To get a stock SQLite file
  * that the standard sqlite3 CLI can open, run
@@ -33,8 +47,8 @@ import crypto from 'crypto';
 import Database from 'better-sqlite3';
 
 export interface ConnectOptions {
-  /** Storage mode: "local" (default) or "s3". */
-  mode?: 'local' | 's3';
+  /** Storage mode: "local" (default), "s3", or "https". */
+  mode?: 'local' | 's3' | 'https';
   /** S3 bucket name (required when mode = "s3"). */
   bucket?: string;
   /** S3 key prefix. Defaults to a stable prefix derived from the database path. */
@@ -56,10 +70,18 @@ export interface ConnectOptions {
    * manifest-aware page cache. Set to "0" to disable.
    */
   pageCache?: string;
+  /**
+   * Root URL of the turbolite object tree (required when mode = "https").
+   * Example: "https://cdn.example.com/mydb". Must not have a trailing slash.
+   */
+  baseUrl?: string;
+  /** ****** for authenticated HTTPS endpoints (mode = "https", optional). */
+  bearerToken?: string;
 }
 
 let _vfsCounter = 0;
 const _s3VfsByFingerprint = new Map<string, string>();
+const _httpsVfsByFingerprint = new Map<string, string>();
 
 /**
  * Find the bundled loadable extension binary.
@@ -123,6 +145,14 @@ function s3Fingerprint(parts: Array<string | number | boolean | undefined | null
 
 function defaultS3VfsName(fingerprint: string): string {
   return `turbolite-s3-${crypto
+    .createHash('sha256')
+    .update(fingerprint)
+    .digest('hex')
+    .slice(0, 16)}`;
+}
+
+function defaultHttpsVfsName(fingerprint: string): string {
+  return `turbolite-https-${crypto
     .createHash('sha256')
     .update(fingerprint)
     .digest('hex')
@@ -223,10 +253,12 @@ export function connect(
     prefetchThreads,
     readOnly = false,
     pageCache = '64MB',
+    baseUrl,
+    bearerToken,
   } = opts ?? {};
 
-  if (mode !== 'local' && mode !== 's3') {
-    throw new Error(`mode must be 'local' or 's3', got '${mode}'`);
+  if (mode !== 'local' && mode !== 's3' && mode !== 'https') {
+    throw new Error(`mode must be 'local', 's3', or 'https', got '${mode}'`);
   }
 
   const effectiveBucket = bucket ?? process.env.TURBOLITE_BUCKET;
@@ -247,6 +279,15 @@ export function connect(
     }
     if (cacheDir != null) process.env.TURBOLITE_CACHE_DIR = cacheDir;
     if (readOnly) process.env.TURBOLITE_READ_ONLY = 'true';
+  }
+
+  if (mode === 'https') {
+    const effectiveBaseUrl = baseUrl ?? process.env.TURBOLITE_BASE_URL;
+    if (!effectiveBaseUrl) {
+      throw new Error(
+        "mode='https' requires a baseUrl. Pass baseUrl or set TURBOLITE_BASE_URL."
+      );
+    }
   }
 
   if (compressionLevel != null) {
@@ -282,6 +323,25 @@ export function connect(
         `Failed to register file-first VFS '${vfsName}' for ${absPath}`
       );
     }
+  } else if (mode === 'https') {
+    const effectiveBaseUrl = baseUrl ?? process.env.TURBOLITE_BASE_URL ?? '';
+    const effectiveBearerToken = bearerToken ?? process.env.TURBOLITE_BEARER_TOKEN ?? null;
+    const fingerprint = s3Fingerprint([absPath, effectiveBaseUrl, effectiveBearerToken]);
+    let registered = _httpsVfsByFingerprint.get(fingerprint);
+    if (!registered) {
+      registered = defaultHttpsVfsName(fingerprint);
+      const rc = bootstrap
+        .prepare('SELECT turbolite_register_https_vfs(?, ?, ?, ?)')
+        .pluck()
+        .get(registered, absPath, effectiveBaseUrl, effectiveBearerToken) as number;
+      if (rc !== 0) {
+        throw new Error(
+          `Failed to register HTTPS VFS '${registered}' for ${absPath} at ${effectiveBaseUrl}`
+        );
+      }
+      _httpsVfsByFingerprint.set(fingerprint, registered);
+    }
+    vfsName = registered;
   } else {
     const fingerprint = s3Fingerprint([
       absPath,
@@ -324,8 +384,12 @@ export function connect(
     vfsName = registered;
   }
 
+  // HTTPS mode is inherently read-only; open with readonly flag so SQLite
+  // does not attempt WAL/journal writes that would fail against a remote endpoint.
+  const isReadOnly = readOnly || mode === 'https';
+
   const db = openUri(`file:${absPath}?vfs=${vfsName}`, absPath, {
-    readonly: readOnly,
+    readonly: isReadOnly,
   });
 
   // turbolite manages its own manifest-aware page cache. Disable SQLite's
