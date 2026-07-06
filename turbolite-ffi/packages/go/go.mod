@@ -1,4 +1,4 @@
-module github.com/russellromney/turbolite/packages/go
+module github.com/pentamorfico/turbolite/turbolite-ffi/packages/go
 
 go 1.21
 

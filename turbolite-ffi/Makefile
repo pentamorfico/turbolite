@@ -43,7 +43,7 @@ lib: ## Build standalone cdylib with bundled SQLite (for C / Python / Go / Node 
 
 # ── Loadable extension ────────────────────────────────────────────
 
-EXT_FEATURES ?= zstd,cli-s3
+EXT_FEATURES ?= zstd,cli-s3,https
 
 .PHONY: ext
 ext: ## Build loadable extension (default: with S3 cli-s3 feature)

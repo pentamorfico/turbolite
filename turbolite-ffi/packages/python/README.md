@@ -1,8 +1,18 @@
 # turbolite
 
-Compressed SQLite for Python. Transparent zstd compression via a custom VFS — works with the standard `sqlite3` module.
+Compressed SQLite for Python. Transparent zstd compression via a custom VFS — works with the standard `sqlite3` module. Supports local storage, S3 cloud storage, and read-only HTTPS (CDN/static-file) mode.
 
 ## Install
+
+### From this fork (builds the native extension automatically)
+
+```bash
+pip install "git+https://github.com/pentamorfico/turbolite.git@main#subdirectory=turbolite-ffi/packages/python"
+```
+
+**Requirements:** `cargo` must be on `PATH`. Install from <https://rustup.rs> if missing. The build compiles the Rust extension with `loadable-extension,cli-s3,https,zstd` features.
+
+### From PyPI (upstream)
 
 ```bash
 pip install turbolite
@@ -10,10 +20,12 @@ pip install turbolite
 
 ## Usage
 
+### Local mode (compressed, file-first)
+
 ```python
 import turbolite
 
-# File-first: /data/app.db is the local page image (turbolite-owned).
+# /data/app.db is the local page image (turbolite-owned).
 # /data/app.db-turbolite/ holds hidden implementation state
 # (manifest, cache, staging logs).
 conn = turbolite.connect("/data/app.db")
@@ -26,55 +38,111 @@ print(rows)  # [(1, 'alice')]
 conn.close()
 ```
 
-`app.db` is turbolite's compressed page image. It is not promised to be
-opened directly by stock `sqlite3`. To produce a normal SQLite file the
-standard `sqlite3` CLI can read, use `iterdump`:
+### S3 cloud mode
 
 ```python
-src = turbolite.connect("/data/app.db")
-dst = sqlite3.connect("/data/exported.sqlite")
-dst.executescript("\n".join(src.iterdump()))
-dst.close()
-src.close()
+conn = turbolite.connect("/data/app.db", mode="s3",
+    bucket="my-bucket",
+    endpoint="https://t3.storage.dev")
 ```
 
-### Lower-level entry point
+### HTTPS read-only mode
 
-If you need direct access to the SQLite extension (e.g. to register
-multiple per-tenant VFSes from a single connection), call
-`turbolite.load(conn)` and use the `turbolite_register_file_first_vfs(name,
-db_path)` SQL function yourself. The bare `cache_dir`-based
-`turbolite_register_vfs(name, cache_dir)` is still available for embedders
-who want to manage the cache layout directly, but new code should use
-`turbolite.connect()` or the file-first SQL function.
+Query a turbolite database published as static files on any HTTPS server
+(CDN, public S3 bucket, university data portal, etc.). The connection is
+**read-only**.
 
-### SQL functions
-
-The extension registers helper SQL functions:
+**Constraints on the remote layout:**
+- The remote URL must expose `manifest.msgpack` and a `p/` directory
+  with page-group objects.
+- A plain `.db` file served over HTTPS is **not** a valid backend.
+- A local sidecar/cache directory is created at `<path>-turbolite/`.
 
 ```python
-conn.execute("SELECT turbolite_version()").fetchone()
-# ('0.1.0',)
+import turbolite
+
+# Open against a public HTTPS turbolite dataset
+conn = turbolite.connect(
+    "/tmp/emapper.db",
+    mode="https",
+    base_url="https://sid.erda.dk/share_redirect/GMqhSrgpvx/emapper_turbolite_https_1m",
+)
+print(conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone())
+conn.close()
 ```
 
-## How it works
+With a bearer token for authenticated endpoints:
 
-`turbolite.load(conn)` loads a platform-specific SQLite loadable extension (`.so`/`.dylib`) bundled inside the Python package. The extension registers a custom VFS named "turbolite" that transparently compresses pages with zstd.
+```python
+conn = turbolite.connect(
+    "/tmp/mydb.db",
+    mode="https",
+    base_url="https://cdn.example.com/mydb",
+    bearer_token="tok123",
+)
+```
 
-Your existing `sqlite3` code works unchanged — just open with `?vfs=turbolite` in a URI connection string.
+## API
+
+### `turbolite.connect(path, **options)`
+
+Open a turbolite database. Returns a `sqlite3.Connection`.
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `mode` | `str` | `"local"` | `"local"`, `"s3"`, or `"https"` |
+| `bucket` | `str` | — | S3 bucket (required for `mode="s3"`) |
+| `endpoint` | `str` | AWS S3 | Custom S3 endpoint URL |
+| `prefix` | `str` | auto | S3 key prefix |
+| `region` | `str` | SDK default | AWS region |
+| `cache_dir` | `str` | `<path>-turbolite` | Local sidecar directory |
+| `compression_level` | `int` | `3` | Zstd level 1-22 |
+| `read_only` | `bool` | `False` | Read-only mode |
+| `page_cache` | `str` | `"64MB"` | Page cache size. Set to `"0"` to disable |
+| `base_url` | `str` | — | Root HTTPS URL (required for `mode="https"`) |
+| `bearer_token` | `str` | — | ****** for authenticated HTTPS |
+
+### `turbolite.load(conn)`
+
+Load the extension into an existing `sqlite3.Connection`.
+
+### `turbolite.state_dir_for_database_path(path)`
+
+Return the sidecar directory path (e.g. `/data/app.db-turbolite`).
+
+## HTTPS mode — limitations
+
+- **Read-only.** Writes raise an error.
+- The remote must expose `manifest.msgpack` and `p/` at `base_url`.
+  A plain `.db` file will not work.
+- The first query fetches the manifest over HTTPS; subsequent pages
+  are fetched on demand. A local sidecar at `<path>-turbolite/` caches
+  downloaded pages.
+- No authentication beyond a bearer token is supported.
 
 ## Build from source
 
 ```bash
-# Build the loadable extension
-cd ../..
-make ext
+# From the turbolite-ffi/ directory
+cd turbolite-ffi
 
-# Copy into the package
-cp target/release/turbolite.dylib packages/python/turbolite/
-# or on Linux: cp target/release/turbolite.so packages/python/turbolite/
+# Build extension with HTTPS enabled
+make ext EXT_FEATURES="cli-s3,https,zstd"
 
-# Install in development mode
-cd packages/python
-pip install -e .
+# Copy and install in dev mode
+cp ../../target/release/libturbolite_ffi.so packages/python/turbolite/turbolite.so  # Linux
+# cp ../../target/release/libturbolite_ffi.dylib packages/python/turbolite/turbolite.dylib  # macOS
+cd packages/python && pip install -e .
 ```
+
+## Environment variables
+
+| Variable | Description |
+|---|---|
+| `TURBOLITE_BUCKET` | S3 bucket (S3 mode) |
+| `TURBOLITE_ENDPOINT_URL` | Custom S3 endpoint (S3 mode) |
+| `TURBOLITE_BASE_URL` | Root HTTPS URL (HTTPS mode fallback) |
+| `TURBOLITE_BEARER_TOKEN` | ****** for authenticated HTTPS |
+| `TURBOLITE_MEM_CACHE_BUDGET` | Page cache size (default `64MB`) |
+| `TURBOLITE_COMPRESSION_LEVEL` | Zstd level 1-22 (default `3`) |
+

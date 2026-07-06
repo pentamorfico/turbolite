@@ -5,6 +5,22 @@
 // database/sql interface: prepared statements, param binding, transactions,
 // connection pooling, etc.
 //
+// # Import path (pentamorfico fork)
+//
+//	go get github.com/pentamorfico/turbolite/turbolite-ffi/packages/go
+//
+// The extension binary (turbolite.so / turbolite.dylib) must be either:
+//   - placed in the working directory of the process, or
+//   - pointed to via the TURBOLITE_EXT_PATH environment variable.
+//
+// Build the extension with HTTPS enabled:
+//
+//	cd turbolite-ffi
+//	make ext EXT_FEATURES="cli-s3,https,zstd"
+//	# produces target/release/libturbolite_ffi.{so,dylib}
+//	# rename / symlink to turbolite.{so,dylib} and place in your process cwd,
+//	# or set TURBOLITE_EXT_PATH=/path/to/turbolite.so
+//
 // Local mode (default), file-first:
 //
 //	db, err := turbolite.Open("/data/app.db", nil)
@@ -27,8 +43,12 @@
 //
 //	db, err := turbolite.Open("/tmp/mydb.db", &turbolite.Options{
 //	    Mode:    "https",
-//	    BaseURL: "https://cdn.example.com/mydb",
+//	    BaseURL: "https://sid.erda.dk/share_redirect/GMqhSrgpvx/emapper_turbolite_https_1m",
 //	})
+//	if err != nil { log.Fatal(err) }
+//	var n int
+//	db.QueryRow("SELECT COUNT(*) FROM sqlite_master").Scan(&n)
+//	fmt.Println(n)
 //
 //	// With a bearer token for authenticated endpoints:
 //	db, err := turbolite.Open("/tmp/mydb.db", &turbolite.Options{
@@ -36,6 +56,10 @@
 //	    BaseURL:     "https://cdn.example.com/mydb",
 //	    BearerToken: "tok123",
 //	})
+//
+// HTTPS mode is read-only. The remote must expose manifest.msgpack and p/
+// at BaseURL. A plain .db file served over HTTPS is not a valid backend.
+// A local sidecar/cache is created at <path>-turbolite/.
 //
 // Note: app.db is turbolite's compressed page image. It is not promised
 // to be opened directly by stock sqlite3. To get a stock SQLite file,
